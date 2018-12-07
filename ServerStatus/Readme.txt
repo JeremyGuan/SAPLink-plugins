@@ -1,1 +1,1 @@
-Server status auto monitoring
+Server status auto monitoring, developed by Python
