@@ -1,0 +1,3920 @@
+#!/bin/sh -
+#--------------------------------------------------------------------------
+version()
+{
+  echo '# @(#) $Id: //bas/745_STACK/src/krn/startscripts/startsap#2 $'
+}
+#
+# NAME : startsap or stopsap
+#
+# PURPOSE :
+#      Start/Stop SAP Database and SAP Instances
+#
+
+# HISTORY
+# 02.01.2009  d023322  create history
+# 02.01.2009  d023322  startsap and stopsap now the same file
+# 18.03.2009  d023322  get DIR_HOME with sappfpar to get the currect work directory of the instances
+# 29.04.2009  d023322  check for launcher path and add jdbcconnect.jar libraries for old launcher path
+# 21.11.2009  d023322  set hasABAP=1 for ASCS instance because database checking is possible via R3trans
+# 11.12.2009  d023322  set new value hasSpecial for all other instances while starting database should be done for this instances also
+# 17.12.2009  d023322  check hasSpecial also for stop database
+# 11.03.2010  d001712  Write trace information to the logfile
+# 22.03.2010  d001712  Missing jar files for DB Check before the first start.
+# 04.05.2010  d001712  Exit Handling
+# 07.05.2010  d001712  Correct order for start and stop R3
+# 18.05.2010  d001712  modify trace output
+# 10.06.2010  d001712  write timestamp to the logfile and tracefile
+# 11.06.2010  d001712  use jddi.jar, antlr.jar and frame.jar from sltools directory
+# 15.06.2010  d001712  problems with startsap db
+# 23.06.2010  d001712  problems by translation uppercase to lowecase with SUN
+# 07.07.2010  d001712  Revised Trace output
+# 27.10.2010  d001712  Special fix for OS/390
+# 18.05.2011  d029385  Stop database if hasspecial=1
+# 21.07.2011  c5015189 In case of OS/390 don't start SAP Host Agent
+# 14.11.2013  d029037  Enable startsap/stopsap for OS/400
+
+##################################
+###############################
+############################
+#########################
+######################         FUNCTIONS
+###################
+################
+#############
+##########
+
+#====================================================================
+#
+# FUNCTION: usage1
+#
+# PURPOSE:
+# printout command syntax and parameter dependent for startsap and stopsap
+#
+usage1()
+{
+
+case "$BASENAME" in
+  startsap*)
+    _output="Start";;
+  stopsap*)
+    _output="Stop";;
+  *)
+    _output="";;
+esac
+
+cat <<EOF
+
+ Parameters <task>:
+      check               Check Database and SAP instance status
+      r3 | j2ee           $_output SAP Instance only
+      db                  $_output ABAP Database only
+      jdb                 $_output J2EE Database only
+      ccms                $_output CCMS Agent (obsolete, see note 1136330)
+      all                 $_output Database and SAP Instance
+      startupsrv          $_output sapstartsrv
+
+EOF
+}
+
+
+
+
+
+#====================================================================
+#
+# FUNCTION: usage2
+#
+# PURPOSE:
+# printout command syntay and parameter independent for startsap and stopsap
+#
+
+usage2()
+{
+cat <<EOF
+
+ ENVIRONMENT :
+
+      SAPSYSTEMNAME       must be set
+      R3S_LOGDIR          optional
+      LOGTRACE            optional
+      TRACE               optional
+
+ RETURN CODES :
+
+   OPTION = check:
+      the sum of the following values will be returned:
+         1  ABAP database is running (R3trans -d)
+         2  Java database is running (jdbcconnect)
+         4  SCS instance is running
+         8  ASCS instance is running
+        16  ABAP instance is running
+        32  JAVA instance is running
+        64  TRX instance is running
+
+   else:
+         0 OK
+         1 OS configuration error
+         2 called with wrong parameters
+         3 user not authorized to stop DB and SAP instance
+         4 Environment not set
+         5 Database shutdown failed
+         6 Database still running on remote DB server
+         7 Shutdown of instance failed
+         8 Start profile or Instance profile not found
+        10 Implementation error: call support
+        12 Command not found
+        13 virtual host error
+
+EOF
+}
+
+#====================================================================
+#
+# FUNCTION: usage
+#
+# PURPOSE:
+# printout command syntay and parameters independent for startsap and stopsap
+#
+usage()
+{
+cat <<EOF
+
+Usage (Old Style): `basename $0` [db|r3|j2ee|ccms|all|check|startupsrv] [<instance>] [<virtual hostname>]"
+
+Example: `basename $0` r3 DVEBGMS00 cic11
+
+
+Usage (New Style): `basename $0`  [-t | -task <task>]
+                             [-i | -instance <instance>]
+                             [-v | -vhost "<virtual hostname>[ <virtual hostname>]*"]
+                             [-c | -check]
+                             [-h | -help]
+                             [-r | -rootdir <root dirtory for upgrade>]
+                             [-u | -user]   <user for upgrade>
+                             [-V | -VERSION]
+                             [-C | -checkVHost]
+
+Example: `basename $0` -t r3 -i DVEBGMS00 -v "cic11 cic12"
+
+ Parameters <instance>:
+      DVEBMGS??           ABAP Central Instance
+      D??                 ABAP Dialog Instance
+      ASCS??              ABAP SCS Instance
+      SCS??               Java SCS Instance
+      J??                 Java Dialog Instance
+      JC??                Java Central Instance
+      TRX??               TREX Instance
+      JMS??               JMS Instance
+      ERS??               Enque Replication Service Instance
+      SMDA??              Diagnostics Agent Instance
+      W??                 Web Services Instance
+      G??                 Gateway Instance
+      V??                 Virus Scan Server Instance
+
+ Parameter <root direcoty for upgrade>:
+      default: /usr/sap/$SAPSYSTEMNAME
+
+ Parameter <user for upgrade>:
+      default: empty
+ for starting the shadow system during upgrade, rootdir and user must specify
+
+ Parameter -checkVHost:
+      default: no check of virtual host
+ Programm exit when the virtual host ist not known as local IP Adress (needed for cluster installation)
+EOF
+
+usage1;
+usage2;
+}
+
+
+
+
+
+#====================================================================
+#
+# FUNCTION: setVHostArray
+#
+# PURPOSE:
+# select all profiles found in profile directory an check it with
+# pustVHostsFromProfile
+#
+
+setVHostArray()
+{
+  setTrace "## setVHostArray() start"
+  sp="${sp} ";
+
+  # Multiple instances
+  _TEMPINST=""
+  _PROFILES=`echo ${PROFILE_DIR}/${SAPSYSTEMNAME}_???*_?*`
+
+  setTrace "_PROFILES=$_PROFILES"
+
+  # how many profiles exists for the same instance type
+  _nrProfiles=`echo $_PROFILES | wc -w`
+  _nrProfiles=`echo $_nrProfiles`               # remove trailing blanks
+  setTrace "_nrProfiles=$_nrProfiles"
+
+  if [ "$_nrProfiles" -gt 0 ]; then
+    pushVHostsFromProfile ${_PROFILES}           # write array VHOSTS
+  fi
+
+  setTrace "VHOSTS=$VHOSTS"
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## setVHostArray() done"
+}
+
+#====================================================================
+#
+# FUNCTION: setVip()
+#
+# PURPOSE:  set the $vip virtual host ip address with the different ping commands
+#
+#====================================================================
+setVip()
+{
+  setTrace "## setVip() start";
+  sp="${sp} ";
+
+  for VHOST in $VHOSTS; do
+    case `uname` in
+      Linux)
+        vip=`$PING -c 1 -w 2 $VHOST 2>/dev/null   | head -1 | awk '{ print $3 }' | sed -e 's/[():]//g'`
+        ;;
+      AIX*)
+        vip=`$PING -c 1 $VHOST 2>/dev/null   | head -1 | awk '{ print $3 }' | sed -e 's/[():]//g'`
+        ;;
+      OS400*)
+        vip=`$PING -c 1 -w 2 "$VHOST" 2>/dev/null`
+
+  ;;
+      Sun*)
+        vip=`$PING -s $VHOST 1 1 2>/dev/null | grep icmp_seq | awk '{ print $5 }' | sed -e 's/[():]//g'`
+        ;;
+      HP*)
+        vip=`$PING $VHOST -n 1 2>/dev/null   | grep icmp_seq | awk '{ print $4 }' | sed -e 's/[():]//g'`
+        ;;
+      *)
+        vip=`$PING -c 1 $VHOST 2>/dev/null   | head -1 | awk '{ print $3 }' | sed -e 's/[():]//g'`
+        ;;
+    esac
+    # set vip to any value when it is empty otherwise the following grep command get an error
+    setTrace "vip=$vip";
+    if [ "X$vip" = "X" ]; then
+      exitOnError 13 "ERROR: virtual IP Adress not found with $PING command."
+    fi
+  done
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## setVip() done";
+}
+#====================================================================
+#
+# FUNCTION: runIfconfig()
+#
+# PURPOSE:  check the virtual host with the ifconfig command for diffent hosts
+# set rc_ifconfig =  0 for ok
+# set rc_ifconfig != 0 for not found
+#
+runIfconfig()
+{
+  setTrace "## runIfconfig() start"
+  sp="${sp} ";
+
+  # set initial INTERFACE
+
+  # set intial rc_ifconfig
+  rc_ifconfig=1;
+
+  # search the right interface from netstat
+  # some platforms has the ifconfig -a command to check
+  # for the other we must search over all interfaces with netstat
+  # to get the right interface
+
+  case `uname` in
+  HP*)
+    # check that option -w is available
+    # in some old releases the option is not possible
+    netstat -iw > /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+      A=`netstat -iw | awk '{print $1}'`
+    else
+      A=`netstat -i | awk '{print $1}'`
+    fi
+    for i in $A
+    do
+      "$IFCONFIG" "$i" 2>/dev/null | grep $vip 2>&1 1>/dev/null
+      rc_ifconfig=$?
+      # trace output
+      if [ $rc_ifconfig -eq 0 ]; then
+        break;
+      fi
+    done
+    ;;
+  Linux*)
+    "$IP" addr show 2>/dev/null | grep $vip 2>&1 1>/dev/null
+    rc_ifconfig=$?
+    ;;
+  *)
+    "$IFCONFIG" -a 2>/dev/null | grep $vip 2>&1 1>/dev/null
+    rc_ifconfig=$?
+    ;;
+  esac
+  setTrace "rc_ifconfig=$rc_ifconfig"
+  if [ "$rc_ifconfig" -ne 0 ]; then
+    exitOnError 13 "ERROR: virtual host not found in ifconfig list"
+  fi
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## runIfconfig() done"
+}
+
+
+#====================================================================
+#
+# FUNCTION: runVHostCheck()
+#
+# PURPOSE: check that the vhost is in the ifconfig list, when not exit
+#
+#
+# IMPORTANT:
+#
+#====================================================================
+runVHostCheck()
+{
+  setTrace "## runVHostCheck() start";
+  sp="${sp} ";
+
+  setVip;
+  runIfconfig;
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## runVHostCheck() done";
+}
+
+
+#====================================================================
+#
+# FUNCTION: setDbUser
+
+# $1 = new database schema user for upgrade or empty
+#
+setDbUser()
+{
+  setTrace "## setDbUser() start: @=$*";
+  sp="${sp} ";
+
+  if [ "X" = "X$1" ]; then
+    SAPUSER=""
+    UPGRADE_CONNECT=""
+    dbs_sapr3=""
+    auth_shadow_upgrade=0
+  else
+    SAPUSER="$1" ;         export SAPUSER
+    UPGRADE_CONNECT="$1" ; export UPGRADE_CONNECT
+    dbs_sapr3="$1" ;       export dbs_sapr3
+  fi
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## setDbUser() done";
+}
+
+
+#====================================================================
+#
+# FUNCTION: setRootDir
+
+# set global variable USR_SAP_SID
+# $1 = new USR_SAP path or empty
+#
+setRootDir()
+{
+  setTrace "## setRootDir() start: @=$*";
+  sp="${sp} ";
+
+  if [ "X" = "X$1" ]; then
+    USR_SAP=/usr/sap
+  else
+    USR_SAP=$1;
+    DIR_LIBRARY=${1}/exe;                         export DIR_LIBRARY
+  fi
+
+  USR_SAP_SID=${USR_SAP}/${SAPSYSTEMNAME}
+  PROFILE_DIR=${USR_SAP_SID}/SYS/profile;
+
+  setTrace "USR_SAP=$USR_SAP";
+  setTrace "USR_SAP_SID=$USR_SAP_SID";
+  setTrace "PROFILE_DIR=$PROFILE_DIR";
+  setTrace "DIR_LIBRARY=$DIR_LIBRARY"
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## setRootDir() done";
+}
+
+#====================================================================
+#
+# FUNCTION: prepare
+#
+# PURPOSE:  set status of installed instances and databases
+#
+# GLOBAL VARIABLES
+#
+# SAPDBHOST SAPJDBHOST
+# DB_LOCAL JDB_LOCAL
+# DB_RUNNING JDB_RUNNING
+#
+prepare()
+{
+  setTrace "## prepare() start";
+  sp="${sp} ";
+
+  # set variable SAPDBHOST
+  set_sapdbhost;
+
+  # abap database is local?
+  set_db_local;
+  DB_LOCAL=$?;
+  set_db_sid $DB_LOCAL;
+
+  # ABAP database is running?
+  set_db_running;
+  DB_RUNNING=$?;
+
+
+  # set variables SAPJDBHOST
+  set_sapjdbhost
+
+  # java database is local?
+  set_jdb_local;
+  JDB_LOCAL=$?;
+
+  # java database is running
+  if [ $DB_RUNNING -eq 1 ]; then
+    JDB_RUNNING=$DB_RUNNING;
+  else
+    set_jdb_running;
+    JDB_RUNNING=$?;
+  fi
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## prepare() done";
+}
+
+#====================================================================
+#
+# FUNCTION: checkInstance
+#
+# PURPOSE:  check whether given parameter is an instance
+#
+# GLOBAL PARAMETER:
+# INST:
+#
+# RETURN: 0: is a correct instance type
+#        else: no correct instance type
+#
+
+checkInstance()
+{
+  setTrace "## checkInstance() start: @=$*";
+  sp="${sp} ";
+
+  _rc=0;
+  INST=`echo $1 | awk '/^SCS[0-9][0-9]$/{print $1} /^ASCS[0-9][0-9]$/{print $1} /^D.+[0-9][0-9]$/{print $1} /^JC[0-9][0-9]$/{print $1} /^D[0-9][0-9]$/{print $1} /^J[0-9][0-9]$/{print $1} /^G[0-9][0-9]$/{print $1} /^TRX[0-9][0-9]$/{print $1} /^W[0-9][0-9]$/{print $1} /^JMS[0-9][0-9]$/{print $1} /^ERS[0-9][0-9]$/{print $1} /^SMDA[0-9][0-9]$/{print $1} /^V[0-9][0-9]$/{print $1}'`
+  if [ "X" = "X$INST" ]; then
+    _rc=1;
+  fi
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## checkInstance() done: $_rc";
+  return $_rc;
+}
+
+#====================================================================
+#
+# FUNCTION: checkTask
+#
+# PURPOSE: check given parameter is a valid TASK?
+#
+# GLOBAL PARAMETER
+# TASK
+#
+# RETURN: 0: is a correct TASK
+#        else: no correct TASK
+#
+#
+checkTask()
+{
+  setTrace "## checkTask() start: @=$*";
+  sp="${sp} ";
+
+  _rc=0;
+  # set input option to lowercase
+  _opt="`echo $1 | $TRUL`"
+  setTrace "_opt=$_opt";
+
+  case $_opt in
+  check)
+    TASK="CHECK";
+    vcheck="true";;
+  db|jdb)
+    TASK="DB";;
+  r3|j2ee)
+    TASK="R3";;
+  all)
+    TASK="ALL";;
+  startupsrv)
+    TASK="STARTUPSRV";;
+  sapstartsrv)
+    TASK="STARTUPSRV";;
+  ccms)
+    TASK="CCMS";;
+  *)
+    _rc=1;;
+  esac
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## checkTask() done: $_rc";
+  return $_rc;
+}
+
+#====================================================================
+#
+# FUNCTION: setHostname
+#
+# PURPOSE:
+# set global variable VHOST and HOSTNAME
+#
+setHostname()
+{
+  setTrace "## setHostname start";
+  sp="${sp} ";
+
+  case `uname` in
+    OS/390* | z/OS* | AIX* | BOS*| OS400*)
+    VHOSTS=`hostname -s`
+    HOSTNAME=`hostname -s`
+    alias hostname='hostname -s'
+    ;;
+  *)
+    VHOSTS=`hostname`
+    HOSTNAME=`hostname`
+    ;;
+  esac
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## setHostname() done";
+}
+
+#====================================================================
+#
+# FUNCTION: os390_fndcmd()
+# --- function implementing the `which'-command
+#
+#====================================================================
+
+os390_fndcmd()
+{
+( # start subshell
+  setTrace "## os390_fndcmd() start"
+  sp="${sp} ";
+
+  arg="$*"
+  rc=0;
+  if [ ! -z "$arg" ];   then
+    IFS_SAVE="$IFS"
+    IFS=':'
+    for comp in ${PATH}
+    do
+      cand="${comp}/${arg}"
+      if [ -x "${cand}" ];    then
+        writeLog "${cand}"
+        sp=`echo "$sp"|sed s/" "//`;
+        setTrace "## os390_fndcmd() done: $rc"
+        exit $rc;
+      fi
+    done
+    IFS="$IFS_SAVE"
+    echo "${arg}: not found"    1>&2
+    rc=1;
+  fi
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## os390_fndcmd() done: $rc"
+  exit $rc;
+) # end subshell
+}
+
+#====================================================================
+#
+# FUNCTION: setTrace()
+#
+# PURPOSE:
+# Trace the given parameter and printout in $LOGTRACE
+#
+# GLOBAL VARIABLES
+# LOGTRACE:   trace filename
+#====================================================================
+setTrace()
+{
+  if [ -z "$LOGTRACE" ]; then
+    LOGTRACE="${HOME}/${BASENAME}.trc"
+  fi
+  if [ -z "$TRACEHEADER" ]; then
+    printf "Trace of system startup/check of SAP System $SAPSYSTEMNAME on `date`\n\n" > $LOGTRACE
+    TRACEHEADER="true"
+  fi
+  # find start and end of the function
+  st=`echo $* | sed -e "s/\(##\)\(.*\)\(start\)\(.*\)/\1\3/" -e "s/ *//g"`
+  do=`echo $* | sed -e "s/\(##\)\(.*\)\(done\)\(.*\)/\1\3/" -e "s/ *//g"`
+  d=`date +%T`;
+  if [ "$do" = "##done" ]; then
+    #printf "$sp$*\n$sp} $d\n\n" >> $LOGTRACE;
+    printf "$sp}$d $*\n\n" >> $LOGTRACE;
+    done="true";
+  elif [ "$st" = "##start" ]; then
+    nl="\n";
+    [ "$done" = "true" ] && nl="";
+    #printf "$nl$sp{ $d\n$sp$*\n" >> $LOGTRACE
+    printf "$nl$sp{$d $*\n" >> $LOGTRACE
+    done="";
+  else
+    printf "$sp$*\n" >> $LOGTRACE
+    done="";
+  fi
+}
+
+#====================================================================
+#
+# FUNCTION: writeLog()
+#
+# PURPOSE:
+# write information in $LOGTRACE
+#
+# GLOBAL VARIABLES
+# LOGFILE:   $LOGFILE
+#====================================================================
+writeLog()
+{
+  printf "$*\n"
+  setTrace "$*";
+  if [ ! -z "$LOGFILE" ]; then
+    #d=`date +"%d.%m.%Y %H:%M:%S"`;
+    d=`date +%T`;
+    printf "\n$LINE\n$d\n$*\n" >> $LOGFILE
+  fi
+}
+
+#====================================================================
+#
+# FUNCTION: exitOnError()
+#
+# PURPOSE:
+# print the errormessage and exit program
+#
+# GLOBAL VARIABLES
+#====================================================================
+exitOnError()
+{
+  sp="";
+  # form for message: <exit number> <error message>
+  exitnr=$1
+  errmsg=$2
+
+  if [ ! -z "$errmsg" ]; then
+    printf "$errmsg\n"
+    if [ ! -z "$LOGFILE" ]; then
+      printf "$errmsg\n" >> $LOGFILE
+      printf " See $LOGFILE for details\n\n"
+    fi
+    setTrace "$errmsg";
+    printf "\nplease send the tracefile $LOGTRACE to support\n\n"
+  fi
+  setTrace "\nExit code $exitnr";
+  if [ "$exitnr" -eq 0 ]; then
+    setTrace "Program ends without error\n";
+  fi
+  exit $exitnr
+}
+
+
+#====================================================================
+#
+# FUNCTION: runCheck()
+#
+# PURPOSE: start the startsap check option and
+# printout the status of all instances and the abap/java database
+#
+#
+# IMPORTANT:
+# valid return codes < 256
+# HP-UX has a max valid return codes < 128
+# so i set the maximum return code to 127
+# see return codes in usage*()
+#
+#====================================================================
+runCheck()
+{
+  setTrace "## runCheck() start";
+  sp="${sp} ";
+
+  LOGFILE="${R3S_LOGDIR}/${BASENAME}_check.log"
+  setTrace "LOGFILE=$LOGFILE";
+
+  #setHostname;
+  setVHostArray;
+  set_instance;
+  prepare;
+
+
+  rc=0
+  _ABAPCHECK=0;
+  _JAVACHECK=0;
+  setTrace "DB_RUNNING=$DB_RUNNING";
+  rc=`expr $rc + $DB_RUNNING \* 1`
+  setTrace "set_db_running: rc = $rc"
+  rc=`expr $rc + $JDB_RUNNING \* 2`
+  setTrace "set_jdb_running: rc = $rc"
+
+  if [ "$INSTscs" ]; then
+    set_r3_running "$INSTscs";
+    _rc=$?
+    rc=`expr $rc + $_rc \* 4`
+    setTrace "set_r3_running SCS: rc = $rc"
+  fi
+  if [ "$INSTascs" ]; then
+    set_r3_running "$INSTascs";
+    _rc=$?
+    rc=`expr $rc + $_rc \* 8`
+    setTrace "set_r3_running ASCS: rc = $rc"
+  fi
+  if [ "$INSTers" ]; then
+    set_r3_running "$INSTers";
+    _rc=$?
+    setTrace "set_r3_running ERS: rc = $rc"
+  fi
+  if [ "$INSTsmda" ]; then
+    set_r3_running "$INSTsmda";
+  fi
+  if [ "$INSTdvebmgs" ]; then
+    set_r3_running "$INSTdvebmgs";
+    _rc=$?
+    if [ "$_ABAPCHECK" -ne 1 ]; then
+      rc=`expr $rc + $_rc \* 16`
+      _ABAPCHECK=1;
+    fi
+    setTrace "set_r3_running DVEBMGS: rc = $rc"
+  fi
+  if [ "$INSTd" ]; then
+    set_r3_running "$INSTd";
+    _rc=$?
+    if [ "$_ABAPCHECK" -ne 1 ]; then
+      _ABAPCHECK=1;
+      rc=`expr $rc + $_rc \* 16`
+    fi
+    setTrace "set_r3_running D: rc = $rc"
+  fi
+  if [ "$INSTjc" ]; then
+    set_r3_running "$INSTjc";
+    _rc=$?
+    if [ "$_JAVACHECK" -ne 1 ]; then
+      rc=`expr $rc + $_rc \* 32`
+      _JAVACHECK=1;
+    fi
+    setTrace "set_r3_running JC: rc = $rc"
+  fi
+  if [ "$INSTj" ]; then
+    set_r3_running "$INSTj";
+    _rc=$?
+    if [ "$_JAVACHECK" -ne 1 ]; then
+      rc=`expr $rc + $_rc \* 32`
+      _JAVACHECK=1;
+    fi
+    setTrace "set_r3_running J: rc = $rc"
+  fi
+  if [ "$INSTjms" ]; then
+    set_r3_running "$INSTjms";
+    _rc=$?
+    if [ "$_JAVACHECK" -ne 1 ]; then
+      rc=`expr $rc + $_rc \* 32`
+      _JAVACHECK=1;
+    fi
+    setTrace "set_r3_running JMS: rc = $rc"
+  fi
+  if [ "$INSTtrx" ]; then
+    set_r3_running "$INSTtrx";
+  fi
+  if [ "$INSTw" ]; then
+    set_r3_running "$INSTw";
+  fi
+  if [ "$INSTv" ]; then
+    set_r3_running "$INSTv";
+  fi
+
+  for i in `echo "$NINST"`; do
+    setTrace "NINST=$i";
+    set_r3_running "$i";
+  done
+  setTrace "runCheck: rc=$rc"
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## runCheck() done $rc";
+  return $rc; # return startsap with return code
+}
+
+
+#====================================================================
+#
+# FUNCTION: OS400_ifconfig()
+#
+# PURPOSE:  Implement PASE command ifconfig for OS/400
+#
+#====================================================================
+OS400_ifconfig()
+{
+  # QSH CMD('db2 "SELECT INTERNET FROM QUSRSYS.QATOCIFC')
+  #system 'QSH CMD('"'"'db2 "SELECT INTERNET FROM QUSRSYS.QATOCIFC"'"'"')'
+
+  # CALL PGM(QZDFMDB2) PARM('SELECT INTERNET FROM QUSRSYS.QATOCIFC')
+  system "CALL PGM(QZDFMDB2) PARM('SELECT INTERNET FROM QUSRSYS.QATOCIFC')"
+}
+
+#====================================================================
+#
+# FUNCTION: setIfconfig()
+#
+# PURPOSE:  search for the ifconfig command and
+# set global variable $IFCONFIG
+#
+#====================================================================
+setIfconfig()
+{
+  setTrace "## setIfconfig() start"
+  sp="${sp} ";
+
+  if [ "OS400" = `uname` ]; then
+    IFCONFIG=OS400_ifconfig
+  elif [ -x /sbin/ifconfig ]; then
+    IFCONFIG=/sbin/ifconfig
+  elif [ -x /etc/ifconfig ]; then
+    IFCONFIG=/etc/ifconfig
+  elif [ -x /usr/sbin/ifconfig ]; then
+    IFCONFIG=/usr/sbin/ifconfig
+  elif [ -x /usr/bin/ifconfig ]; then
+    IFCONFIG=/usr/bin/ifconfig
+  else
+    IFCONFIG=ifconfig
+  fi
+  setTrace "IFCONFIG=$IFCONFIG"
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## setIfconfig() done"
+}
+
+
+#====================================================================
+#
+# FUNCTION: setIp()
+#
+# PURPOSE:  search for the ip command and
+# set global variable $IP
+# only valid for Linux -- needed for Oracle RAC database
+#
+#====================================================================
+setIp()
+{
+  setTrace "## setIp() start"
+  sp="${sp} ";
+  if [ "Linux" = `uname` ]; then
+    if [ -x /sbin/ip ]; then
+      IP=/sbin/ip
+    elif [ -x /etc/ip ]; then
+      IP=/etc/ip
+    elif [ -x /usr/sbin/ip ]; then
+      IP=/usr/sbin/ip
+    elif [ -x /usr/bin/ip ]; then
+      IP=/usr/bin/ip
+    else
+      IP=ip
+    fi
+    setTrace "IP=$IP"
+  fi
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## setIp() done"
+}
+
+
+#====================================================================
+#
+# FUNCTION: OS400_ping()
+#
+# PURPOSE:  Implement PASE command ping for OS/400
+#
+#====================================================================
+OS400_ping()
+{
+(
+  rmtsys=""
+  npkt=""
+  wtime=""
+
+  while [ 0 -lt $# ]
+  do
+    case "$1" in
+      '-c')
+        shift;
+        if [ 0 -lt $# ]
+        then
+          npkt=`expr 0 + "$1"`
+          shift
+        fi
+        ;;
+      '-w')
+        shift;
+        if [ 0 -lt $# ]
+        then
+          wtime=`expr 0 + "$1"`
+          shift
+        fi
+        ;;
+       *)
+         break
+         ;;
+     esac
+  done
+
+  if [ 1 -ne $# ]
+  then
+    echo "Usage OS400_ping [-c <count>] [-w <waittime>] <remote system>" 1>&2
+    exit 42
+  fi
+
+  rmtsys="$1"
+  shift
+
+  system_cmd="PING RMTSYS(${rmtsys})"
+
+  if [ -n "$npkt" ]
+  then
+    system_cmd="${system_cmd} NBRPKT(${npkt})"
+  fi
+  if [ -n "$wtime" ]
+  then
+    system_cmd="${system_cmd} WAITTIME(${wtime})"
+  fi
+
+  out=`system "$system_cmd"`
+  rc=$?
+  if [ 0 -ne $rc ]
+  then
+    exit 1
+  fi
+  echo "$out"|head -1|awk '{ print $NF }'|sed 's/\.$//'
+
+  exit $rc
+)
+}
+
+#====================================================================
+#
+# FUNCTION: setPing()
+#
+# PURPOSE:  search for the ping command and
+# set global variable $PING
+#
+#====================================================================
+setPing()
+{
+  setTrace "## setPing() start"
+  sp="${sp} ";
+
+  # searching for the ping command
+  case `uname` in
+  OS/390*)
+    PINGCNT=`os390_fndcmd oping | wc -w`;
+    if [ $PINGCNT -eq 1 ]; then
+      PING=`os390_fndcmd oping`;
+    else
+      exitOnError 12 "### cannot find command 'ping' ###"
+    fi
+    ;;
+  OS400*)
+        PING=OS400_ping
+    ;;
+  *)
+    if [ -x /usr/sbin/ping ]; then
+        PING=/usr/sbin/ping
+    elif [ -x /etc/ping ]; then
+        PING=/etc/ping
+    elif [ -x /bin/ping ]; then
+        PING=/bin/ping
+    elif [ -x /usr/bin/ping ]; then
+        PING=/usr/bin/ping
+    else
+        exitOnError 12 "### cannot find command 'ping' ###"
+    fi
+  ;;
+  esac
+  setTrace "PING=$PING"
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## setPing() done"
+}
+
+#====================================================================
+#
+# FUNCTION: set_path()
+#
+# PURPOSE:  set the new path to start the instances
+#
+# PARAMETER
+# $1 = PATH to set
+#
+# GLOBAL VARIABLES:
+# LD_LIBRARY_PATH
+# LIBPATH
+# SHLIB_PATH
+#
+#====================================================================
+
+set_path()
+{
+  setTrace "## set_path() start: @=$*"
+  sp="${sp} ";
+
+  if [ "X" = "X$1" ]; then
+    exitOnError 10 "Implementation error in set_path(): call support"
+  fi
+
+  N_PATH=$1
+  setTrace "N_PATH=$N_PATH"
+
+  # set DIR_LIBRARY
+  O_DIR_LIBRARY=$DIR_LIBRARY
+  DIR_LIBRARY=$N_PATH;  export DIR_LIBRARY
+
+  case `uname` in
+  AIX* | OS/390* | OS400*)
+    O_LIBPATH=$LIBPATH
+    LIBPATH=$N_PATH:$LIBPATH; export LIBPATH
+    setTrace "LIBPATH=$LIBPATH"
+    setTrace "O_LIBPATH=$O_LIBPATH"
+    ;;
+
+  HP*)
+    O_SHLIB_PATH=$SHLIB_PATH
+    SHLIB_PATH=$N_PATH:$SHLIB_PATH; export SHLIB_PATH
+    setTrace "SHLIB_PATH=$SHLIB_PATH"
+    setTrace "O_SHLIB_PATH=$O_SHLIB_PATH"
+    ;;
+
+  Linux* | SIN* | Reliant* | OSF* | Sun*)
+    O_LD_LIBRARY_PATH=$LD_LIBRARY_PATH
+    LD_LIBRARY_PATH=$N_PATH:$LD_LIBRARY_PATH; export LD_LIBRARY_PATH
+    setTrace "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+    setTrace "O_LD_LIBRARY_PATH=$O_LD_LIBRARY_PATH"
+    ;;
+
+  *)
+    O_LD_LIBRARY_PATH=$LD_LIBRARY_PATH
+    LD_LIBRARY_PATH=$N_PATH:$LD_LIBRARY_PATH; export LD_LIBRARY_PATH
+    setTrace "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+    setTrace "O_LD_LIBRARY_PATH=$O_LD_LIBRARY_PATH"
+    ;;
+
+  esac
+  RESTORE_PATH=1;
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## set_path() done"
+}
+
+#====================================================================
+#
+# FUNCTION: restore_path()
+#
+# PURPOSE:  restore to the old path of LIBPATH, LD_LIBRARY_PATH, SHLIB_PATH
+#
+#====================================================================
+restore_path()
+{
+  setTrace "## restore_path() start"
+  sp="${sp} ";
+
+  if [ "$RESTORE_PATH" -eq 1 ]; then
+
+    DIR_LIBRARY=$O_DIR_LIBRARY; export DIR_LIBRARY
+
+    case `uname` in
+
+    AIX* | OS/390* | OS400*)
+      LIBPATH=$O_LIBPATH; export LIBPATH
+      setTrace "LIBPATH=$LIBPATH"
+      ;;
+
+    HP*)
+      SHLIB_PATH=$O_SHLIB_PATH; export SHLIB_PATH
+      setTrace "SHLIB_PATH=$SHLIB_PATH"
+      ;;
+
+    Linux* | SIN* | Reliant* | OSF*)
+      LD_LIBRARY_PATH=$O_LD_LIBRARY_PATH; export LD_LIBRARY_PATH
+      setTrace "LD_LBRARY_PATH=$LD_LIBRARY_PATH"
+      ;;
+
+    *)
+      LD_LIBRARY_PATH=$O_LD_LIBRARY_PATH; export LD_LIBRARY_PATH
+      setTrace "LD_LBRARY_PATH=$LD_LIBRARY_PATH"
+      ;;
+
+    esac
+    RESTORE_PATH=0;
+  fi
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## restore_path() done"
+}
+
+#====================================================================
+#
+# FUNCTION: setInstanceDo
+#
+# PURPOSE:
+#
+# PARAMETER
+# $1 = INSTANCE
+# $2 = profile of INSTANCE
+#
+# SET GLOBAL VARIABLES
+# INST:                one of the exist INST
+# INST*:               set any type of INST
+# INSTFOUND:           number of instances
+# hasJava:             java instance available
+# hasABAP:             abap instance available
+# hasSpecial:          all other instances like G SCS available
+#
+# EXIT WITH ERROR:
+# input parameter is empty
+# no instance type found
+#
+
+setInstanceDo()
+{
+  setTrace "## setInstanceDo() start: @=$*":
+  sp="${sp} ";
+
+  # input parameter need a value
+  if [ -z "$1" ]; then
+    exitOnError 10 "Implementation error in setInstanceDo(): call support"
+  fi
+
+  _II=`echo ${1} | awk '/^JC[0-9][0-9]$/{print $1}'`
+  if [ "$_II" ]; then
+    INSTjc=$_II
+    PROFILEjc=${2};
+    hasJava=1
+
+    # set INSTANCE to any type of value
+    INST=$_II
+    INSTFOUND=`expr $INSTFOUND + 1`
+    setTrace "setInstanceDo: INSTjc=$INSTjc":
+    setTrace "setInstanceDo: PROFILEjc=$PROFILEjc":
+    fi
+
+  _II=`echo ${1} | awk '/^J[0-9][0-9]$/{print $1}'`
+  if [ "$_II" ]; then
+    INSTj=$_II
+    PROFILEj=${2};
+    hasJava=1
+
+    # set INST to any type of value
+    INST=$_II
+    INSTFOUND=`expr $INSTFOUND + 1`
+    setTrace "setInstanceDo: INSTj=$INSTj":
+    setTrace "setInstanceDo: PROFILEj=$PROFILEj":
+  fi
+
+  _II=`echo ${1} | awk '/^D.+[0-9][0-9]$/{print $1}'`
+  if [ "$_II" ]; then
+    INSTdvebmgs=$_II
+    PROFILEdvebmgs=${2};
+    hasABAP=1
+
+    # set INST to any type of value
+    INST=$_II
+    INSTFOUND=`expr $INSTFOUND + 1`
+    setTrace "setInstanceDo: INSTdvebmgs=$INSTdvebmgs":
+    setTrace "setInstanceDo: PROFILEdvebmgs=$PROFILEdvebmgs":
+  fi
+
+  _II=`echo ${1} | awk '/^D[0-9][0-9]$/{print $1}'`
+  if [ "$_II" ]; then
+    INSTd=$_II
+    PROFILEd=${2};
+    hasABAP=1
+
+    # set INST to any type of value
+    INST=$_II
+    INSTFOUND=`expr $INSTFOUND + 1`
+    setTrace "setInstanceDo: INSTd=$INSTd":
+    setTrace "setInstanceDo: PROFILEd=$PROFILEd":
+  fi
+
+  _II=`echo ${1} | awk '/^SCS[0-9][0-9]$/{print $1}'`
+  if [ "$_II" ]; then
+    INSTscs=$_II
+    PROFILEscs=${2};
+    hasSpecial=1
+
+    # set INST to any type of value
+    INST=$_II
+    INSTFOUND=`expr $INSTFOUND + 1`
+    setTrace "setInstanceDo: INSTscs=$INSTscs":
+    setTrace "setInstanceDo: PROFILEscs=$PROFILEscs":
+  fi
+
+  _II=`echo ${1} | awk '/^ASCS[0-9][0-9]$/{print $1}'`
+  if [ "$_II" ]; then
+    INSTascs=$_II
+    PROFILEascs=${2};
+
+    # ASCS instance: database can be checked on this host
+    # with R3trans (should be available i hope) but not on zOS
+    #
+    # SCS instance: database cannot checked with
+    # jdbcconnect.jar because of missing jar files
+    # hasSpecial=1
+    hasSpecial=1
+
+    # set INST to any type of value
+    INST=$_II
+    INSTFOUND=`expr $INSTFOUND + 1`
+    setTrace "setInstanceDo: INSTascs=$INSTascs":
+    setTrace "setInstanceDo: PROFILEascs=$PROFILEascs":
+  fi
+
+  _II=`echo ${1} | awk '/^G[0-9][0-9]$/{print $1}'`
+  if [ "$_II" ]; then
+    INSTg=$_II
+    hasSpecial=1
+
+    # set INST to any type of value
+    INST=$_II
+    INSTFOUND=`expr $INSTFOUND + 1`
+    setTrace "setInstanceDo: INSTg=$INSTg":
+    setTrace "setInstanceDo: PROFILEg=$PROFILEg":
+  fi
+
+  _II=`echo ${1} | awk '/^TRX[0-9][0-9]$/{print $1}'`
+  if [ "$_II" ]; then
+    INSTtrx=$_II
+    PROFILEtrx=${2};
+    hasSpecial=1
+
+    # set INST to any type of value
+    INST=$_II
+    INSTFOUND=`expr $INSTFOUND + 1`
+    setTrace "setInstanceDo: INSTtrx=$INSTtrx":
+    setTrace "setInstanceDo: PROFILEtrx=$PROFILEtrx":
+  fi
+
+  _II=`echo ${1} | awk '/^W[0-9][0-9]$/{print $1}'`
+  if [ "$_II" ]; then
+    INSTw=$_II
+    PROFILEw=${2};
+    hasSpecial=1
+
+    # set INST to any type of value
+    INST=$_II
+    INSTFOUND=`expr $INSTFOUND + 1`
+    setTrace "setInstanceDo: INSTw=$INSTw":
+    setTrace "setInstanceDo: PROFILEw=$PROFILEw":
+  fi
+
+  _II=`echo ${1} | awk '/^JMS[0-9][0-9]$/{print $1}'`
+  if [ "$_II" ]; then
+    INSTjms=$_II
+    PROFILEjms=${2};
+    hasJava=1
+
+    # set INST to any type of value
+    INST=$_II
+    INSTFOUND=`expr $INSTFOUND + 1`
+    setTrace "setInstanceDo: INSTjms=$INSTjms":
+    setTrace "setInstanceDo: PROFILEjms=$PROFILEjms":
+  fi
+
+  _II=`echo ${1} | awk '/^ERS[0-9][0-9]$/{print $1}'`
+  if [ "$_II" ]; then
+    INSTers=$_II
+    PROFILEers=${2};
+    hasSpecial=1
+
+    # set INST to any type of value
+    INST=$_II
+    INSTFOUND=`expr $INSTFOUND + 1`
+    setTrace "setInstanceDo: INSTers=$INSTers":
+    setTrace "setInstanceDo: PROFILEers=$PROFILEers":
+  fi
+
+  _II=`echo ${1} | awk '/^SMDA[0-9][0-9]$/{print $1}'`
+  if [ "$_II" ]; then
+    INSTsmda=$_II
+    PROFILEsmda=${2};
+    hasSpecial=1
+
+    # set INST to any type of value
+    INST=$_II
+    INSTFOUND=`expr $INSTFOUND + 1`
+    setTrace "setInstanceDo: INSTsmda=$INSTsmda":
+    setTrace "setInstanceDo: PROFILEsmda=$PROFILEsmda":
+  fi
+
+  _II=`echo ${1} | awk '/^V[0-9][0-9]$/{print $1}'`
+  if [ "$_II" ]; then
+    INSTv=$_II
+    PROFILEv=${2};
+    hasSpecial=1
+
+    # set INST to any type of value
+    INST=$_II
+    INSTFOUND=`expr $INSTFOUND + 1`
+    setTrace "setInstanceDo: INSTv=$INSTv":
+    setTrace "setInstanceDo: PROFILEv=$PROFILEv":
+  fi
+
+
+  # no valid instance found
+  if [ "$INSTFOUND" -eq 0 ]; then
+    exitOnError 10 "Implementation error 2 in setInstanceDo() : call support"
+  fi
+  unset _II;
+  setTrace "setInstanceDo: INST=$INST":
+  setTrace "setInstanceDo: INSTFOUND=$INSTFOUND":
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## setInstanceDo() done: $INSTFOUND":
+  return "$INSTFOUND";
+}
+
+#====================================================================
+#
+# FUNCTION: init_log
+#
+# PURPOSE:  Initialize logfile
+#
+
+init_log()
+{
+  setTrace "## init_log() start"
+  sp="${sp} ";
+
+  setTrace "LOGFILE=$LOGFILE";
+  setTrace "init_log $0 $*";
+  printf "Trace of system startup/check of SAP System $SAPSYSTEMNAME on `date`\n\n" > $LOGFILE
+  printf "Called command: $1 $2\n" >> $LOGFILE
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## init_log() done"
+}
+
+#====================================================================
+#
+# FUNCTION: getarg
+#
+#
+# PURPOSE:  Check command line options and set global variables
+#
+# PARAMETER
+# $* = all input parameter
+#
+# GLOBAL VARIABLES
+# INST:           found instance in profile directory
+# TASK:           set the correct task
+# VHOST:          virtual host given on command line
+#
+# NEEDED GLOBAL VARIABLES
+# SAPSYSTEMNAME
+# USR_SAP_SID
+#
+# RETURN
+# _OPTIONS:       number of correct options found
+#
+
+getarg()
+{
+  setTrace "## getarg() start"
+  sp="${sp} ";
+
+  TASK="";
+  INST="";
+  VHOST="";
+  _OPTIONS=0;
+  for opt in $*; do
+
+    # check whether given option is the INST
+    if [ "X$INST" = "X" ]; then
+      checkInstance $opt;
+      if [ $? -eq 0 ]; then
+        _OPTIONS=`expr $_OPTIONS + 1`
+        setTrace "INST=$INST"
+        continue;
+      fi
+    fi
+
+
+    # check whether given option is the TASK
+    # set to lower case and check whether given option is a task
+    if [ "X$TASK" = "X" ]; then
+      checkTask $opt;
+      if [ $? -eq 0 ]; then
+        _OPTIONS=`expr $_OPTIONS + 1`
+        setTrace "TASK=$TASK"
+        continue;
+      fi
+    fi
+
+    # check whether given option is a virtual host
+    if [ "X$VHOSTS" = "X" ]; then
+      VHOSTS="$opt";
+      setTrace "VHOSTS=$VHOSTS"
+      _OPTIONS=`expr $_OPTIONS + 1`
+    fi
+
+  done
+  if [ "X$TASK" = "XCHECK" ]; then
+    runCheck;
+    exit $?;
+  fi
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## getarg() done: $_OPTIONS"
+  return "$_OPTIONS";
+}
+
+#====================================================================
+#
+# FUNCTION: set_instance
+#
+# PURPOSE:  Checks for multiple instances and
+#           sets the variable INST
+# PARAMETER
+# no parameter
+#
+
+set_instance()
+{
+  setTrace "## set_instance() start"
+  sp="${sp} ";
+
+  # Multiple instances
+  _TEMPINST=""
+  _CHECKINST="SCS ASCS ERS SMDA \"D?*\" JC D J JMS G TRX W V"
+  for _Iset_instance in $_CHECKINST; do
+    eval _Iset_instance=$_Iset_instance
+    for VHOST in $VHOSTS; do
+      _PROFILES=`echo ${PROFILE_DIR}/${SAPSYSTEMNAME}_${_Iset_instance}??_${VHOST}`
+
+      setTrace "_PROFILES=$_PROFILES"
+
+      # how many profiles exists for the same instance type
+      _nrProfiles=`echo $_PROFILES | wc -w`
+      _nrProfiles=`echo $_nrProfiles`               # remove trailing blanks
+      setTrace "_nrProfiles=$_nrProfiles"
+      setTrace "_Iset_instance=$_Iset_instance"
+
+      if [ "$_nrProfiles" -gt 0 ]; then
+
+        # IMPORTANT:
+        # set _Iset_instance in "", otherwise the shell translate D?* before deliver to pushProfiles
+        # set _PROFILES in {} otherwise the parameter list in $* is one
+        pushProfiles "${_Iset_instance}" ${_PROFILES}
+      fi
+    done
+  done
+
+  setTrace "NINST=$NINST"
+  setTrace "INSTFOUND=$INSTFOUND"
+  setTrace "NINSTFOUND=$NINSTFOUND"
+  setTrace "hasABAP=$hasABAP"
+  setTrace "hasJava=$hasJava"
+  setTrace "hasSpecial=$hasSpecial"
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## set_instance() done"
+}
+
+#====================================================================
+#
+# FUNCTION: pushVHostsFromArg
+#
+# PURPOSE:
+# copy all virtual hostnames from argument list -vhost into the array VHOSTS
+# there are no check that the hosts are local or remote
+#
+pushVHostsFromArg()
+{
+  setTrace "## pushVHostsFromArg() start: @=$*"
+  sp="${sp} ";
+
+  VHOSTS=$*;                              # set list of vhosts to VHOSTS
+  setTrace "VHOSTS=$VHOSTS"
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## pushHostsFromArg() done"
+}
+
+#====================================================================
+#
+# FUNCTION: pushVHostsFromProfile
+#
+# PURPOSE:
+# copy all virtual hostnames get from profile directory like
+# SID_INSTANCE_VHOST
+# there are some checks that the hosts are local or remote
+# and only local hosts are insert in the array VHOSTS
+#
+pushVHostsFromProfile()
+{
+  setTrace "## pushVHostsFromProfile() start: @=$*"
+  sp="${sp} ";
+
+  for _i in $*; do
+    _DUMMY=`echo ${_i} | awk -F/ '{print $(NF)}'`
+
+    setTrace "_DUMMY=$_DUMMY"
+    # problem when hostname has also an "_"
+    _VHOST=`echo ${_DUMMY} | awk -F_ '{
+      i=3
+      printf($i)
+      while(i < NF) {
+        i++
+        printf("%s%s",FS,$i)
+      }
+    }'`
+
+    setTrace "_VHOST=$_VHOST"
+
+    _set=0;
+    isVHostLocal $_VHOST
+    if [ $? -eq 1 ]; then                                             # find an virtual host as local host
+
+      for VHOST in $VHOSTS; do                                           # check host already in list
+        if [ "X$VHOST" = "X$_VHOST" ]; then
+          _set=1;
+          break;
+        fi
+      done
+      if [ $_set -eq 0 ];then                                    # host not in VHOSTS list
+        VHOSTS="${VHOSTS} ${_VHOST}"
+      fi
+    fi
+
+  done
+  setTrace "VHOSTS=${VHOSTS}"
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## pushVHostsFromProfile() done"
+}
+
+#====================================================================
+#
+# FUNCTION: pushProfiles
+#
+# PURPOSE:
+# set any instance type in $INST?*
+# set $INST and increase $INSTFOUND
+# sets the variable $NINST for additional Instances if exists
+# increase $NINSTFOUND if exists
+#
+# PARAMETER
+# $1 = INSTANCE
+# $2 = PROFILE
+# $* = PROFILE of intances with the same type as PROFILE in $2
+#
+# GLOBAL VARIABLES
+# INST:        any first instance
+# INST?*:      all first instances
+# INSTFOUND:   number of all first instances
+# NINST:       array of additional instances
+# NINSTFOUND:  number of instances in NINST
+
+pushProfiles()
+{
+  setTrace "## pushProfiles() start: @=$*"
+  sp="${sp} ";
+
+  # save first imput parameter
+  _IpushProfiles=${1}
+  shift
+
+  _TEMPINST=`echo ${1} | awk -F/ '{print $(NF)}' | awk -F_ '{print $2}'`
+  setTrace "_TEMPINST=$_TEMPINST"
+
+  # set one of the INST* variable
+  if [ -n "$_TEMPINST" -a ! "X$_IpushProfiles??" = "X$_TEMPINST" ]; then
+    setInstanceDo "$_TEMPINST" ${1};
+  fi
+
+  shift
+
+  for _i in $*; do
+    NINST="${NINST} `echo $_i | awk -F_ '{print $2}'`"
+    NINSTFOUND=`expr $NINSTFOUND + 1`
+    setTrace "NINST=${NINST}"
+    setTrace "NINSTFOUND=$NINSTFOUND"
+  done
+
+  unset _IpushProfiles;
+  unset _i;
+  unset _TEMPINST;
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## pushProfiles() done"
+}
+
+#====================================================================
+#
+# FUNCTION: set_sapdbhost()
+#
+# PURPOSE:  sets the variable SAPDBHOST
+#
+# get this value with sappfpar from instance and default profile
+# SAPDBHOST is also set for non ABAP systems
+#
+
+set_sapdbhost()
+{
+  setTrace "## set_sapdbhost() start"
+  sp="${sp} ";
+
+  _PROFILE="";
+
+  if [ -n "$PROFILEdvebmgs" ]; then
+    _PROFILE=$PROFILEdvebmgs;
+  elif [ -n "$PROFILEd" ]; then
+    _PROFILE=$PROFILEd;
+  else
+    _PROFILE=$PROFILE_DIR/DEFAULT.PFL
+  fi
+
+  if [ -n "$SAPDBHOST" ] ; then
+    _TMP_SAPDBHOST="$SAPDBHOST"
+    SAPDBHOST=""
+  fi
+
+  if [ -n "$_PROFILE" ]; then
+    setTrace "_PROFILE=$_PROFILE"
+    SAPDBHOST=`sappfpar pf=${_PROFILE} SAPDBHOST 2>/dev/null`
+    setTrace "SAPDBHOST=$SAPDBHOST"
+  fi
+
+  if [ -z "$SAPDBHOST" -a -n "$_TMP_SAPDBHOST" ] ; then
+    SAPDBHOST="$_TMP_SAPDBHOST"
+  fi
+
+  SAPDBHOST=`echo $SAPDBHOST`               # remove trailing blanks
+
+  if [ -n "$_TMP_SAPDBHOST" -a "X$_TMP_SAPDBHOST" != "X$SAPDBHOST" ] ; then
+    setTrace "WARNING: SAPDBHOST in profile different to environment"
+    setTrace "WARNING: set SAPDBHOST to environment variable $SAPDBHOST"
+    SAPDBHOST="$_TMP_SAPDBHOST"
+  fi
+
+  unset _f
+  unset _PROFILE
+  unset _TMP_SAPDBHOST
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## set_sapdbhost() done"
+}
+
+#====================================================================
+#
+# FUNCTION: set_sapjdbhost()
+#
+# PURPOSE:  sets the variable SAPJDBHOST
+#
+# get this value with sappfpar from instance of default profile
+#
+
+set_sapjdbhost()
+{
+  setTrace "## set_sapjdbhost() start"
+  sp="${sp} ";
+
+  if [ -n "$PROFILEjc" ]; then
+    _PROFILE=$PROFILEjc;
+  elif [ -n "$PROFILEj" ]; then
+    _PROFILE=$PROFILEj;
+  elif [ -n "$PROFILEdvebmgs" ]; then
+    _PROFILE=$PROFILEdvebmgs;
+  elif [ -n "$PROFILEscs" ]; then
+    _PROFILE=$PROFILEscs;
+  else
+    _PROFILE=${PRFOFILE_DIR}/DEFAULT.PFL;
+  fi
+
+  if [ -n "$SAPJDBHOST" ] ; then
+    _TMP_SAPJDBHOST="$SAPJDBHOST"
+    SAPJDBHOST=""
+  fi
+
+  if [ -n "$_PROFILE" ]; then
+    SAPJDBHOST=`sappfpar pf=${_PROFILE} j2ee/dbhost 2>/dev/null`
+  fi
+
+  if [ -z "$SAPJDBHOST" -a -n "$_TMP_SAPJDBHOST" ] ; then
+    SAPJDBHOST="$_TMP_SAPJDBHOST"
+  fi
+
+  SAPJDBHOST=`echo $SAPJDBHOST`               # remove trailing blanks
+
+  unset _PROFILE;
+  unset _TMP_SAPJDBHOST;
+  unset _f;
+
+  setTrace "SAPJDBHOST=$SAPJDBHOST"
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## set_sapjdbhost() done"
+}
+
+#====================================================================
+#
+# FUNCTION: check_user
+#
+# PURPOSE:  checks the user starting this script (only sidadm is valid)
+#
+
+check_user()
+{
+  setTrace "## check_user() start: @=$*";
+  sp="${sp} ";
+
+   _USER="`id | awk -F\( '{print $2}' | awk -F\) '{print $1}'`"
+   if [ "X$_USER" != "X$1" ]; then
+      exitOnError 3 "\nERROR: You are user $_USER, but you have to be ${1} to start this script\n"
+   fi
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## check_user() done";
+}
+
+#====================================================================
+#
+# FUNCTION: sapccm4x
+#
+# PURPOSE:
+#
+
+sapccm4x()
+{
+  setTrace "## sapccm4x() start: @=$*";
+  sp="${sp} ";
+
+  for _ii in $INSTdvebmgs $INSTd $INSTscs $INSTascs $INSTers $INSTsmda $INSTj $INSTjc $INSTjms $INSTw $INSTv $INSTtrx $INSTg; do
+
+    # get global variable NR
+    getSapsystemNr $_ii;
+    getExePath "sappfpar" $_ii;
+
+    # set profile
+    for VHOST in $VHOSTS; do
+      _f=$PROFILE_DIR/"$SAPSYSTEMNAME"_"$_ii"_"$VHOST"
+      setTrace "_f=$_f";
+
+      # get agent working directory from sappfpar DIR_LOGGING
+      CCMS_DIRLOGGING=`$EXECMD pf=${_f} DIR_LOGGING 2> /dev/null`
+      setTrace "CCMS_DIRLOGGING=$CCMS_DIRLOGGING";
+
+      if [ ! -f ${CCMS_DIRLOGGING}/sapccm4x/csmconf ]; then
+
+        # nothing to do, CCMS agent not configured
+        setTrace "CCMS agent SAPCCM4X not configured"
+
+      else
+
+        SAPCCM4X="";
+        getExePath "sapccm4x";
+        if [ $? -ne 0 ]; then
+          writeLog "Can not find sapccm4x";
+          writeLog "Start of sapccm4x failed";
+        else
+          SAPCCM4X=$EXECMD
+        fi
+
+        if [ "X" != "X$SAPCCM4X" ]; then
+
+          # check for starting or stopping
+          case $1 in
+          start*)
+            writeLog "Starting CCMS Agent sapccm4x";
+            echo $LINE;
+            setTrace "$SAPCCM4X -DCCMS pf=$_f"
+            eval $SAPCCM4X -DCCMS pf=$_f > /dev/null 2>&1
+            _returncode=$?
+
+            case $_returncode in
+            1)
+              writeLog "CCMS Agent sapccm4x already running on $SAPSYSTEMNAME $_ii $VHOST";
+            ;;
+            0)
+              writeLog "CCMS Agent sapccm4x started for $SAPSYSTEMNAME $_ii $VHOST";
+            ;;
+            *)
+              writeLog "Start of sapccm4x failed for $SAPSYSTEMNAME $_ii $VHOST";
+            ;;
+            esac
+            ;;
+
+          stop*)
+            writeLog "Stopping CCMS Agent sapccm4x";
+            echo $LINE;
+            setTrace "$SAPCCM4X -stop pf=$_f"
+            eval $SAPCCM4X -stop pf=$_f > /dev/null 2>&1
+            _returncode=$?
+
+            case $_returncode in
+            0)
+              writeLog "CCMS Agent sapccm4x stopped for $SAPSYSTEMNAME $INSTANCE $VHOST";
+            ;;
+            *)
+              writeLog "Stopping sapccm4x failed for $SAPSYSTEMNAME $INSTANCE $VHOST";
+            ;;
+            esac
+            ;;
+
+          *)
+            exitOnError 10 "Implementation error in sapccm4x(): call support"
+          esac
+        fi
+      fi
+    done
+  done
+  unset _ii;
+  unset _returncode;
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## sapccm4x() done";
+  return 0;
+}
+
+#====================================================================
+#
+# FUNCTION: isVHostLocal
+#
+# PURPOSE:  checks if virtual host is local or remote
+#
+# RETURN:   1        if local
+#           0        else
+#
+isVHostLocal()
+{
+  setTrace "## isVHostLocal() start: $1"
+  sp="${sp} ";
+
+  VHOST=$1
+  setTrace "VHOST=$VHOST"
+  if [ "X" = "X$VHOST" ]; then
+    exitOnError 10 "Implementation error in isVHostLocal: call support"
+  else
+    if [ `uname` = OS\/390 -o `uname` = z\/OS ]; then
+      _DBIP=`ping $VHOST 2>/dev/null | awk 'NR==1 { print $6 }' | sed -e 's/[():]//g'`
+      if [ -n "$_DBIP" ]; then
+        _IS_LOCAL=`netstat -v | grep "$_DBIP " > /dev/null && echo 1`
+        if [ x$_IS_LOCAL != x"1" ]; then
+          _IS_LOCAL=`netstat -h | grep "$_DBIP " > /dev/null && echo 1`
+        fi
+      fi
+    elif [ `uname` = SunOs ]; then
+      _IS_LOCAL=`netstat -ia | awk "\\$4 ~ /^$VHOST(\\..*)?$/{print 1; exit} "`
+      _IS_LOCAL=${_IS_LOCAL:=0}
+    elif [ `uname` = SunOS ]; then
+      _IS_LOCAL=`netstat -ia | awk "\\$4 ~ /^$VHOST(\\..*)?$/{print 1; exit} "`
+      _IS_LOCAL=${_IS_LOCAL:=0}
+    elif [ `uname` = "HP-UX" ]; then
+      _IS_LOCAL=`netstat -iw | awk "\\$4 ~ /^$VHOST(\\..*)?$/{print 1; exit} "`
+      _IS_LOCAL=${_IS_LOCAL:=0}
+    elif [ `uname` = "OS400" ]; then
+      $PING -c 1 -w 2 $VHOST > /dev/null 2>&1  # check that ping works on this host
+
+      if [ $? -eq 0 ]; then
+        _DBIP=`$PING -c 1 -w 2 $VHOST`
+        _IS_LOCAL=`$IFCONFIG | grep "$_DBIP " > /dev/null && echo 1`
+      else
+        _IS_LOCAL=0;
+      fi
+    elif [ `uname` = "Linux" ]; then
+      $PING -c 1 -w 2 $VHOST > /dev/null 2>&1                 # check that ping works on this host
+      if [ $? -eq 0 ]; then
+        _DBIP=`$PING -c 1 -w 2 $VHOST | head -1 | awk '{ print $3 }' | sed -e 's/[():]//g'`
+        _IS_LOCAL=`$IP addr show | grep "$_DBIP[ /]" > /dev/null && echo 1`
+###RAC:   _IS_LOCAL=`$IFCONFIG | grep "$_DBIP " > /dev/null && echo 1`
+      else
+        _IS_LOCAL=0;
+      fi
+    else
+      _IS_LOCAL=`netstat -i | awk "\\$4 ~ /^$VHOST(\\..*)?$/{print 1; exit} "`
+    fi
+    _IS_LOCAL=${_IS_LOCAL:=0}
+  fi
+  setTrace "_IS_LOCAL=$_IS_LOCAL"
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## isVHostLocal() done: $_IS_LOCAL"
+  return $_IS_LOCAL
+}
+
+#====================================================================
+#
+# FUNCTION: set_db_local
+#
+# PURPOSE:  checks if database is located on local host
+#
+# RETURN:   1        if local
+#           0        else
+#
+
+set_db_local()
+{
+  setTrace "## set_db_local() start"
+  sp="${sp} ";
+
+  for VHOST in $VHOSTS; do
+    setTrace "VHOST=$VHOST"
+
+    if [ "X" = "X$SAPDBHOST" ]; then
+      _DB_LOCAL=0;
+      break;
+    elif [ "X" = "X$VHOST" ]; then
+      exitOnError 10 "Implementation error in set_db_local: call support"
+    elif [ "X$VHOST" = "X$SAPDBHOST" -o `uname -n` = "$SAPDBHOST" ]; then
+      if [ `uname` = OS\/390 -o `uname` = z\/OS ]; then
+        _DB_LOCAL=0
+        break;
+      else
+        _DB_LOCAL=1
+        break;
+      fi
+      # when SAPDBHOST is set and is local then we have an ABAP instance
+      # hasABAP=1;
+    else
+      setTrace "before netstat/ifconfig: _DB_LOCAL=$_DB_LOCAL";
+      setTrace "SAPDBHOST=$SAPDBHOST";
+      if [ `uname` = OS\/390 -o `uname` = z\/OS ]; then
+        _DB_LOCAL=0
+        break;
+      elif [ `uname` = SunOs ]; then
+        _DB_LOCAL=`netstat -ia | awk "\\$4 ~ /^$SAPDBHOST(\\..*)?$/{print 1; exit} "`
+        _DB_LOCAL=${_DB_LOCAL:=0}
+      elif [ `uname` = SunOS ]; then
+        _DB_LOCAL=`netstat -ia | awk "\\$4 ~ /^$SAPDBHOST(\\..*)?$/{print 1; exit} "`
+        _DB_LOCAL=${_DB_LOCAL:=0}
+      elif [ `uname` = "OS400" ]; then
+        _DBIP=`$PING -c 1 -w 2 $SAPDBHOST`
+        _DB_LOCAL=`$IFCONFIG | grep "$_DBIP " > /dev/null && echo 1`
+      elif [ `uname` = "Linux" ]; then
+        _DBIP=`$PING -c 1 -w 2 $SAPDBHOST | head -1 | awk '{ print $3 }' | sed -e 's/[():]//g'`
+        _DB_LOCAL=`$IP addr show | grep "$_DBIP[ /]" > /dev/null && echo 1`
+###RAC:   _DB_LOCAL=`$IFCONFIG | grep "$_DBIP " > /dev/null && echo 1`
+      else
+        _DB_LOCAL=`netstat -i | awk "\\$4 ~ /^$SAPDBHOST(\\..*)?$/{print 1; exit} "`
+      fi
+      _DB_LOCAL=${_DB_LOCAL:=0}
+      setTrace "after netstat/ifconfig: _DB_LOCAL=$_DB_LOCAL";
+      setTrace "SAPDBHOST=$SAPDBHOST";
+    fi
+    if [ $_DB_LOCAL -eq 1 ]; then
+      break;
+    fi
+  done
+  setTrace "set_dblocal: _DB_LOCAL=$_DB_LOCAL";
+  setTrace "SAPDBHOST=$SAPDBHOST";
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## set_db_local() done: $_DB_LOCAL"
+  return $_DB_LOCAL
+}
+
+#====================================================================
+#
+# FUNCTION: set_jdb_local
+#
+# PURPOSE:  checks if database is located on local host
+#           and sets the variable JDB_LOCAL
+#
+# RETURN:   1        if local
+#           0        else
+#
+
+
+set_jdb_local()
+{
+  setTrace "## set_jdb_local() start"
+  sp="${sp} ";
+
+  for VHOST in $VHOSTS; do
+    setTrace "VHOST=$VHOST"
+    if [ "X" = "X$SAPJDBHOST" ]; then
+      _JDB_LOCAL=0;
+      break;
+    elif [ "X" = "X$VHOST" ]; then
+      exitOnError 10 "Implementation error in set_jdb_local: call support"
+    elif [ "X$VHOST" = "X$SAPJDBHOST" -o `uname -n` = "$SAPJDBHOST" ]; then
+      if [ `uname` = OS\/390 -o `uname` = z\/OS ]; then
+        _JDB_LOCAL=0
+        break
+      else
+        _JDB_LOCAL=1
+        break
+      fi
+    else
+      setTrace "before netstat/ifconfig: _JDB_LOCAL=$_JDB_LOCAL"
+      setTrace "SAPJDBHOST=$SAPJDBHOST"
+      if [ `uname` = OS\/390 -o `uname` = z\/OS ]; then
+        _JDB_LOCAL=0
+        break;
+      elif [ `uname` = SunOs ]; then
+        _JDB_LOCAL=`netstat -ia | awk "\\$4 ~ /^$SAPJDBHOST(\\..*)?$/{print 1; exit} "`
+        _JDB_LOCAL=${_JDB_LOCAL:=0}
+      elif [ `uname` = SunOS ]; then
+        _JDB_LOCAL=`netstat -ia | awk "\\$4 ~ /^$SAPJDBHOST(\\..*)?$/{print 1; exit} "`
+        _JDB_LOCAL=${_JDB_LOCAL:=0}
+      elif [ `uname` = "OS400" ]; then
+        _DBIP=`$PING -c 1 -w 2 $SAPDBHOST`
+        _JDB_LOCAL=`$IFCONFIG | grep "$_DBIP " > /dev/null && echo 1`
+      elif [ `uname` = "Linux" ]; then
+        _DBIP=`$PING -c 1 -w 2 $SAPJDBHOST | head -1 | awk '{ print $3 }' | sed -e 's/[():]//g'`
+        _JDB_LOCAL=`$IP addr show | grep "$_DBIP[ /]" > /dev/null && echo 1`
+###RAC:   _JDB_LOCAL=`$IFCONFIG | grep "$_DBIP " > /dev/null && echo 1`
+      else
+        _JDB_LOCAL=`netstat -i | awk "\\$4 ~ /^$SAPJDBHOST(\\..*)?$/{print 1; exit} "`
+      fi
+      _JDB_LOCAL=${_JDB_LOCAL:=0}
+      setTrace "after netstat/ifconfig: _JDB_LOCAL=$_JDB_LOCAL"
+      setTrace "SAPJDBHOST=$SAPJDBHOST"
+    fi
+    if [ $_JDB_LOCAL -eq 1 ]; then
+      break;
+    fi
+  done
+  setTrace "set_jdb_local: _JDB_LOCAL=$_JDB_LOCAL"
+  setTrace "SAPJDBHOST=$SAPJDBHOST"
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## set_jdb_local() done: $_JDB_LOCAL"
+  return $_JDB_LOCAL
+}
+
+
+#====================================================================
+#
+# FUNCTION: get_killsap
+#
+# PURPOSE: get the path to the kill.sap command
+#
+# PARAMETER: instance (name)
+#
+# POST CONDITION: global variables DIR_HOME and KILLSAP are set
+#
+
+get_killsap()
+{
+  setTrace "## get_killsap($1) start"
+  sp="${sp} ";
+
+  # get path to sappfpar
+  getExePath "sappfpar" $1;
+  _SAPPFPAR=$EXECMD;
+
+  # set _INST_PROFILE
+  for VHOST in $VHOSTS; do
+    _INST_PROFILE=${SAPSYSTEMNAME}_${1}_${VHOST}
+    setTrace "_INST_PROFILE=$_INST_PROFILE";
+    if [ -f $PROFILE_DIR/$_INST_PROFILE ]; then
+      break;
+    fi
+  done
+
+  # get path to kill.sap
+  if [ -f $PROFILE_DIR/$_INST_PROFILE ]; then
+    setTrace "$_SAPPFPAR pf=$PROFILE_DIR/$_INST_PROFILE DIR_HOME";
+    DIR_HOME=`$_SAPPFPAR pf=$PROFILE_DIR/$_INST_PROFILE DIR_HOME`;
+    setTrace "DIR_HOME=$DIR_HOME";
+    KILLSAP=${DIR_HOME}/kill.sap;
+    setTrace "KILLSAP=$KILLSAP";
+  else
+    exitOnError 10 "##### get_killsap($1) exit: no profile found"
+  fi
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## get_killsap($1) done"
+}
+
+#====================================================================
+#
+# FUNCTION: set_r3_running
+#
+# PURPOSE:  checks if SAP instance is running
+#
+# PARAMETER: instance name
+#
+# RETURN:   0 = not running
+#           1 = running
+#
+
+set_r3_running()
+{
+  setTrace "## set_r3_running() start"
+  sp="${sp} ";
+
+  writeLog "Checking SAP $SAPSYSTEMNAME Instance ${1}";
+  echo $LINE;
+  get_killsap $1;
+  if [ -f ${KILLSAP} ]; then
+    writeLog "Instance ${1} is running ";
+    _rc=1
+  else
+    writeLog "Instance ${1} is not running ";
+    _rc=0
+  fi
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## set_r3_running() done: $_rc"
+  return $_rc;
+}
+
+#====================================================================
+#
+# FUNCTION: set_db_running
+#
+# PURPOSE:  checks if database is running, moreover we check if
+#              R3trans is able to connect to the database
+#
+
+set_db_running()
+{
+( # start subshell
+  setTrace "## set_db_running() start"
+  sp="${sp} ";
+
+  DB_RUNNING=0
+  if [ "X" != "X$SAPDBHOST" -a ${hasABAP} -eq 1 ]; then
+    if [ "$DB_SID" ]; then
+      writeLog "Checking $DB_SID Database";
+      #echo $LINE;
+      # ora
+      dbs_ora_tnsname=${dbs_ora_tnsname-${SID}};export dbs_ora_tnsname
+
+      if [ "X" != "X$INSTdvebmgs" ]; then
+        getExePath "R3trans" ${INSTdvebmgs};
+      elif [ "X" != "X$INSTd" ]; then
+        getExePath "R3trans" ${INSTd};
+      else
+        EXECMD="R3trans"
+      fi
+      if [ $? -ne 0 ]; then
+        writeLog "cannot found R3trans";
+        DB_RUNNING=0
+      else
+        DBCONNECT_TEST="${EXECMD} -d -w"
+        setTrace "DBCONNECT_TEST=$DBCONNECT_TEST"
+      fi
+
+      if [ "X" != "X$EXEDIR" ]; then
+        set_path $EXEDIR
+      fi
+
+      eval $DBCONNECT_TEST  /dev/null > /dev/null 2>&1
+      returncode=$?
+
+      # restore to old DIR_LIBRARY LD_LIBRARY_PATH
+      restore_path;
+
+      # set return code
+      case $returncode in
+      0 | 4 | 8)
+        writeLog "Database is running";
+        DB_RUNNING=1
+      ;;
+      *)
+        writeLog "Database is not available via R3trans";
+        DB_RUNNING=0
+      ;;
+      esac
+      echo $LINE;
+    fi
+  fi
+
+  setTrace "DB_RUNNING=$DB_RUNNING"
+  setTrace "JDB_RUNNING=$JDB_RUNNING"
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## set_db_running() done: $DB_RUNNING"
+  exit $DB_RUNNING;
+) # end subshell
+}
+
+#====================================================================
+#
+# FUNCTION: set_jdb_running
+#
+# PURPOSE:  checks if J2EE database is running
+#
+#
+#
+# set JDB_RUNNING
+# =0
+# when java database not running
+#
+# =1
+# when java database is running
+#
+# =2
+# sometimes not all jar files available so we set the value JDB_RUNNING=2
+# because we do not know the status
+#
+#
+
+set_jdb_running()
+{
+  setTrace "## set_jdb_running() start"
+  sp="${sp} ";
+
+  JDB_RUNNING=0;
+  if [ "X" != "X$SAPJDBHOST" -a ${hasJava} -eq 1 ]; then
+    writeLog "Checking $DB_SID Database";
+    echo $LINE;
+
+    _check=0;
+    if [ -n "$INSTdvebmgs" ]; then
+      _INST=$INSTdvebmgs;
+      _PROFILE=$PROFILEdvebmgs;
+      BOOTSTRAP=${USR_SAP_SID}/${_INST}/j2ee/cluster/bootstrap
+      if [ -d "$BOOTSTRAP" ]; then
+        _check=1;
+      fi
+    fi
+
+    if [ -n "$INSTjc" -a "$_check" -eq 0 ]; then
+      _INST=$INSTjc;
+      _PROFILE=$PROFILEjc;
+      BOOTSTRAP=${USR_SAP_SID}/${_INST}/j2ee/cluster/bootstrap
+      if [ -d "$BOOTSTRAP" ]; then
+        _check=1;
+      fi
+    fi
+    if [ -n "$INSTj" -a "$_check" -eq 0 ]; then
+      _INST=$INSTj;
+      _PROFILE=$PROFILEj;
+      BOOTSTRAP=${USR_SAP_SID}/${_INST}/j2ee/cluster/bootstrap
+      if [ -d "$BOOTSTRAP" ]; then
+        _check=1;
+      fi
+    fi
+
+    if [ "$_check" -eq 1 ]; then
+      LAUNCHER=${BOOTSTRAP}/sap.com~tc~bl~offline_launcher~impl.jar
+      QUIET="-quiet";
+      if [ ! -f $LAUNCHER ]; then
+        LAUNCHER=${BOOTSTRAP}/launcher.jar
+        # when this $LAUNCHER exists, also $SLTOOLS
+        # needed because they are not under the $BOOTSTRAP folder
+        SLTOOLS=${USR_SAP_SID}/SYS/global/sltools/sharedlib
+
+        # option quiet only works with new launcher
+        QUIET="";
+      fi
+      SECSTORE=`sappfpar pf=${_PROFILE} secstorefs/DIR_LIB 2> /dev/null`
+      if [ "X" = "X$SECSTORE" ]; then
+        SECSTORE=${USR_SAP_SID}/SYS/global/security/lib
+      fi
+      DB_JARS=`sappfpar pf=${_PROFILE} j2ee/dbdriver 2> /dev/null`
+      if [ "X" = "X$DB_JARS" ]; then
+        DB_JARS=`cat ${_PROFILE} | grep -i j2ee\/dbdriver | sed -e 's/\\\:/:/g' | awk -F= '{print $2}'`
+      fi
+      # empty trailing blanks
+      DB_JARS=`echo $DB_JARS`
+
+      getExePath "jdbcconnect.jar";
+      if [ $? -ne 0 ]; then
+        writeLog "jdbcconnect.jar not found";
+      else
+        JDBCCONNECT=${EXECMD}
+      fi
+    fi
+
+    unset _check;
+
+    if [ "$TRACE" ];then
+      for _jar in $LAUNCHER $JDBCCONNECT
+      do
+        if [ ! -f $_jar ]; then
+          echo "WARNING: $_jar not available: cannot check with jdbcconnect.jar"
+          setTrace "WARNING: $_jar not available: cannot check with jdbcconnect.jar"
+        fi
+      done
+
+      unset _jar;
+
+    fi
+
+    setTrace "BOOTSTRAP=$BOOTSTRAP"
+    setTrace "LAUNCHER=$LAUNCHER"
+    setTrace "SECSTORE=$SECSTORE"
+    setTrace "JDBCCONNECT=$JDBCCONNECT"
+    setTrace "DB_JARS=$DB_JARS"
+    setTrace "SLTOOLS=$SLTOOLS";
+
+    # only start jdbcconnect when all jars available and java in path
+    if [ -f "$JDBCCONNECT" -a -f "$LAUNCHER" ]; then
+      _JAVA=`sappfpar pf=${_PROFILE} DIR_SAPJVM 2> /dev/null`
+      setTrace "_JAVA=$_JAVA"
+      if [ -f ${_JAVA}/bin/java ]; then
+        JAVA=${_JAVA}/bin/java
+      else
+        # check java in PATH
+        which java > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+          JAVA=java
+        else
+          case "$BASENAME" in
+            start*)
+              JDB_RUNNING=0
+              [ "$JDB_LOCAL" -eq 0 ] && JDB_RUNNING=1
+            ;;
+            stop*)
+              JDB_RUNNING=1
+              [ "$JDB_LOCAL" -eq 0 ] && JDB_RUNNING=0
+            ;;
+          esac
+          sp=`echo "$sp"|sed s/" "//`;
+          setTrace "## set_jdb_running() done: cannot check but set rc = $JDB_RUNNING";
+          return $JDB_RUNNING;
+        fi
+      fi
+      setTrace "JAVA=$JAVA"
+      setTrace "eval ${JAVA} -classpath ${LAUNCHER} com.sap.engine.offline.OfflineToolStart $QUIET com.sap.inst.jdbc.connect.JdbcCon  ${JDBCCONNECT}:${SECSTORE}/tools:${DB_JARS}:${BOOTSTRAP}:${SLTOOLS} -sec $SAPSYSTEMNAME:$SAPSYSTEMNAME -logFile ${HOME}/JdbcCon.log"
+      eval ${JAVA} -classpath ${LAUNCHER} com.sap.engine.offline.OfflineToolStart $QUIET com.sap.inst.jdbc.connect.JdbcCon ${JDBCCONNECT}:${SECSTORE}/tools:${DB_JARS}:${BOOTSTRAP}:${SLTOOLS} -sec $SAPSYSTEMNAME:$SAPSYSTEMNAME -logFile ${HOME}/JdbcCon.log
+      returncode=$?
+      setTrace "returncode=$returncode"
+
+      case $returncode in
+        0)
+          writeLog "J2EE Database is running";
+          writeLog "See logfile ${HOME}/JdbcCon.log ";
+          JDB_RUNNING=1
+        ;;
+        *)
+          writeLog "J2EE Database is not available via $JDBCONNECT test";
+          writeLog "See logfile ${HOME}/JdbcCon.log ";
+          JDB_RUNNING=0
+        ;;
+      esac
+
+    else
+      setTrace "Not all java jar files availabe"
+      setTrace "Cannot connect to j2ee database via $JDBCCONNECT"
+      JDB_RUNNING=2;
+
+    fi
+
+  fi
+
+
+  setTrace "JDB_RUNNING=$JDB_RUNNING"
+  setTrace "_INST=$_INST"
+  setTrace "_PROFILE=$_PROFILE"
+  setTrace "SAPSYSTEMNAME=$SAPSYSTEMNAME"
+
+  unset _PROFILE;
+  unset _INST;
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## set_jdb_running() done: $JDB_RUNNING";
+  return $JDB_RUNNING;
+}
+
+#====================================================================
+#
+# FUNCTION: Database
+#
+# PURPOSE:  start/stop the database (using script startdb/stopdb)
+#
+
+Database()
+{
+  setTrace "## Database() start: @=$*"
+  sp="${sp} ";
+
+  if [ "X" = "X$1" ]; then
+    exitOnError 10 "Implementation error in Database(): call support"
+  fi
+
+  _returncode=0;
+  case $1 in
+  start*)
+    # start no database for upgrade task
+    if [ $auth_shadow_upgrade -eq 1 ]; then
+      _returncode=0;
+    else
+      if [ "OS400" = `uname` ]
+      then
+        EXECMD=/QOpenSys/usr/bin/true
+        /QOpenSys/usr/bin/true  # Set $? to 0
+      else
+        getExePath "startdb";
+      fi
+
+      if [ $? -ne 0 ]; then
+        exitOnError 5 " Cannot find startdb, DB startup failed"
+      else
+        _STARTDB=${EXECMD}
+      fi
+
+      setTrace "Running $_STARTDB ";
+      eval $_STARTDB
+      _returncode=$?
+
+      # changes are here
+      case $_returncode in
+      0)
+        setTrace "$_STARTDB completed successfully ";
+        DB_RUNNING=1;
+        JDB_RUNNING=1
+      ;;
+      *)
+        exitOnError 5 "DB startup failed"
+      ;;
+      esac
+
+      # wait a little bit to check the database is up/down with R3trans
+      sleep 3;
+    fi
+  ;;
+  stop*)
+    # stop no database for upgrade task
+    if [ $auth_shadow_upgrade -eq 1 ]; then
+      _returncode=0;
+    else
+      if [ "$DB_LOCAL" -eq 1 -a "$DB_RUNNING" -eq 1 ]; then
+        if [ "OS400" = `uname` ]
+        then
+          EXECMD=/QOpenSys/usr/bin/true
+          /QOpenSys/usr/bin/true  # Set $? to 0
+        else
+          getExePath "stopdb";
+        fi
+
+        if [ $? -ne 0 ]; then
+          exitOnError 5 " Cannot find stopdb, DB shutdown failed"
+        else
+          _STOPDB="${EXECMD}"
+          setTrace "_STOPDB=$_STOPDB"
+        fi
+
+        setTrace "Running $_STOPDB ";
+        eval $_STOPDB
+        _returncode=$?
+
+        case $_returncode in
+        0)
+          setTrace "$_STOPDB completed successfully";
+        ;;
+        1)
+        ;;
+        *)
+          exitOnError 5 "$_STOPDB: DB shutdown failed"
+        ;;
+        esac
+
+        # wait a little bit to check the database is up/down with R3trans
+        sleep 3;
+        set_db_running;
+        DB_RUNNING=$?;
+        JDB_RUNNING=$DB_RUNNING;
+      fi
+    fi
+  ;;
+  *)
+    exitOnError 10 "Implementation error 2 in Database(): call support"
+  ;;
+  esac
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## Database() done"
+  return $_returncode
+}
+
+#====================================================================
+#
+# FUNCTION: J2ee_database
+#
+# PURPOSE:  start/stop the J2EE database (using script startdbj2ee/stopj2eedb)
+#
+
+J2ee_database()
+{
+  setTrace "## Jee_database() start: @=$*"
+  sp="${sp} ";
+
+  if [ "X" = "X$1" ]; then
+    exitOnError 10 "Implementation error in J2ee_database(): call support"
+  fi
+
+  _returncode=0;
+
+  case $1 in
+  start*)
+    getExePath startj2eedb;
+    if [ $? -ne 0 ]; then
+      exitOnError 5 "Cannot find startj2eedb, J2EE DB startup failed"
+    else
+      _STARTDB=${EXECMD}
+    fi
+
+    writeLog "Running $_STARTDB";
+    eval $_STARTDB
+    _returncode=$?
+
+    case $_returncode in
+    0)
+      writeLog "$_STARTDB completed successfully";
+      JDB_RUNNING=1
+    ;;
+    *)
+      exitOnError 5 "DB startup failed"
+    ;;
+    esac
+  ;;
+  stop*)
+
+    if [ "$JDB_LOCAL" -eq 1 -a "$JDB_RUNNING" -eq 1 ]; then
+      getExePath "stopj2eedb";
+      if [ $? -ne 0 ]; then
+        exitOnError 5 "Cannot find stopj2eedb, DB shutdown failed"
+      else
+        _STOPDB="${EXECMD}"
+        setTrace "_STOPDB=$_STOPDB"
+      fi
+
+      writeLog "Running $_STOPDB";
+
+      eval $_STOPDB
+      _returncode=$?
+
+      case $_returncode in
+      0)
+        writeLog "$_STOPDB completed successfully";
+        JDB_RUNNING=0
+      ;;
+      1)
+      ;;
+      *)
+        exitOnError 5
+      ;;
+      esac
+
+    fi
+  ;;
+  *)
+    exitOnError 10 "Implementation error 2 in J2ee_database(): call support"
+  ;;
+  esac
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## J2ee_database() done"
+  return $_returncode;
+}
+
+#====================================================================
+#
+# FUNCTION: save_tplog
+#
+# PURPOSE:  Save last version of tp logfile
+#
+
+save_tplog()
+{
+  setTrace "## save_tplog() start"
+  sp="${sp} ";
+
+  get_killsap $1;
+  if [ -z $DIR_HOME ]; then
+    DIR_HOME="$USR_SAP_SID/${1}/work"
+  fi
+  TP_LOG="dev_tp"
+  TP_LOG_OLD=${TP_LOG}".old"
+
+  if [ -w ${DIR_HOME}/$TP_LOG_OLD ];then
+    rm -f ${DIR_HOME}/${TP_LOG_OLD}
+  fi
+
+  if [ -w ${DIR_HOME}/$TP_LOG ];then
+    mv ${DIR_HOME}/$TP_LOG ${DIR_HOME}/$TP_LOG_OLD
+  fi
+
+  if [ ! -f ${DIR_HOME}/$TP_LOG ];then
+    touch ${DIR_HOME}/$TP_LOG
+  fi
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## save_tplog() done"
+}
+
+#====================================================================
+#
+# FUNCTION: getExePath
+#
+# PURPOSE: search for the executable in all known executable pathes
+#          when $2 exists search at first in instance exe
+#
+# GLOBAL VARIABLE
+# PLATFORM and USR_SAP_SID must set
+#
+# SET GLOBAL VARIABLE
+# EXEDIR:  path to the executable
+# EXECMD   complete cmd with path
+#
+# RETURN 0 ok
+#        else not found
+#
+getExePath()
+{
+  setTrace "## getExePath() start: @=$*";
+  sp="${sp} ";
+
+  _rc=1;
+  if [ "X" = "X$PLATFORM" -o "X" = "X$USR_SAP_SID" ]; then
+    exitOnError 10 "Implementation error in getExePath(): call support"
+  elif [ "X" = "X$1" ]; then
+    exitOnError 10 "Implementation error 2 in getExePath(): call support"
+  fi
+
+  # if $2 = instance then search in instance exe dir
+  _EXEDIRI="";
+  _DIR_EXECUTABLE="";
+  if [ "X" != "X$2" ]; then
+    _EXEDIRI="$USR_SAP_SID/${2}/exe"
+    if [ -x ${_EXEDIRI}/${1} ]; then
+      # set LIBRARY PATH
+      set_path $_EXEDIRI;
+    fi
+
+    _SAPPFPAR="$USR_SAP_SID/${2}/exe/sappfpar"
+    # check for existing sappfpar under instance directory
+    if [ ! -x "$_SAPPFPAR" ]; then
+      _SAPPFPAR=sappfpar;
+    fi
+    for VHOST in $VHOSTS; do
+      _INST_PROFILE=${PROFILE_DIR}/${SAPSYSTEMNAME}_${2}_${VHOST}
+      if [ -f $_INST_PROFILE ]; then
+        break;
+      fi
+    done
+    _DIR_EXECUTABLE=`$_SAPPFPAR pf=${_INST_PROFILE} DIR_EXECUTABLE 2>/dev/null`;
+    setTrace "_DIR_EXECUTABLE=$_DIR_EXECUTABLE";
+
+    # restore LIBRARY PATH
+    restore_path;
+  fi
+  _EXEDIRPUT=${USR_SAP}/exe
+  _EXEDIRU=${USR_SAP_SID}/SYS/exe/uc/${PLATFORM}
+  _EXEDIR=${USR_SAP_SID}/SYS/exe/nuc/${PLATFORM}
+  _EXEDIRU1=${USR_SAP_SID}/SYS/exe/runU
+  _EXEDIR1=${USR_SAP_SID}/SYS/exe/run
+  _CTEXEDIR=${USR_SAP_SID}/SYS/exe/ctrun
+
+  if [ -f ${_EXEDIRPUT}/${1} -a $auth_shadow_upgrade -eq 1 ]; then
+    EXECMD=${_EXEDIRPUT}/${1};
+    EXEDIR=${_EXEDIRPUT};
+    _rc=0;
+  elif [ -f ${_DIR_EXECUTABLE}/${1} ]; then
+    EXECMD=${_DIR_EXECUTABLE}/${1};
+    EXEDIR=${_DIR_EXECUTABLE};
+    _rc=0;
+  elif [ -f ${_EXEDIRI}/${1} ]; then
+    EXECMD=${_EXEDIRI}/${1};
+    EXEDIR=${_EXEDIRI};
+    _rc=0;
+  elif [ -f ${_EXEDIR1}/${1} ]; then
+    EXECMD=${_EXEDIR1}/${1};
+    EXEDIR=${_EXEDIR1};
+    _rc=0;
+  elif [ -f ${_EXEDIRU}/${1} ]; then
+    EXECMD=${_EXEDIRU}/${1};
+    EXEDIR=${_EXEDIRU};
+    _rc=0;
+  elif [ -f ${_EXEDIR}/${1} ]; then
+    EXECMD=${_EXEDIR}/${1};
+    EXEDIR=${_EXEDIR};
+    _rc=0;
+  elif [ -f ${_CTEXEDIR}/${1} ]; then
+    EXECMD=${_CTEXEDIR}/${1};
+    EXEDIR=${_CTEXEDIR};
+    _rc=0;
+  elif [ -f ${_EXEDIRU1}/${1} ]; then
+    EXECMD=${_EXEDIRU1}/${1};
+    EXEDIR=${_EXEDIRU1};
+    _rc=0;
+  fi
+
+  unset _EXEDIRPUT;
+  unset _EXEDIRI;
+  unset _EXEDIR;
+  unset _EXEDIRU;
+  unset _CTEXEDIR;
+  unset _EXEDIR1;
+  unset _EXEDIRU1;
+
+  setTrace "EXEDIR=$EXEDIR"
+  setTrace "EXECMD=$EXECMD"
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## getExePath() done: $_rc"
+  return $_rc;
+}
+
+
+
+#==============================================================================
+#
+# FUNCTION: Instance
+#
+# PURPOSE: search in all $*INST* and start/stop this instances with instance_do
+#
+# PARAMETER
+# $1 = start/stop
+#
+# GLOBAL PARAMETER
+#
+# INST* must be set
+# NINST must be set
+#
+# RETURN 0 = ok
+#        else exist with return code
+#
+
+Instance()
+{
+  setTrace "## Instance() start: @=$*"
+  sp="${sp} ";
+
+  if [ $INSTFOUND -ne 0 ]; then
+
+    case $1 in
+    start*)
+      # save tplog for abap instances
+      for _xx in $INSTdvebmgs $INSTd; do
+        save_tplog $_xx;
+      done
+
+      # starting available instances
+      # $NINST is the instance where more than one exists of the same instance type
+      for _xx in $INSTers $INSTscs $INSTascs $INSTdvebmgs $INSTjc $INSTd $INSTj $INSTjms $INSTw $INSTv $INSTtrx $INSTsmda $INSTg `echo "$NINST"`;
+      do
+        setTrace "instance: INST=$_xx"
+
+        getExePath "sapcontrol" $_xx;
+        if [ $? -eq 0 ]; then
+          # sapcontrol available
+          instance_do $1 $_xx;
+        else
+          # start with sapstart not implemented any longer so exit with error
+          exitOnError 10 "sapcontrol not available for instance $_xx"
+        fi
+        _rc=$?;
+        if [ $_rc -ne 0 ]; then
+          exitOnError $_rc;
+        fi
+      done
+
+    ;;
+    stop*)
+      for _xx in `echo "$NINST"` $INSTd $INSTdvebmgs $INSTj $INSTjms $INSTjc $INSTscs $INSTascs $INSTers $INSTw $INSTv $INSTsmda $INSTtrx $INSTg;
+      do
+        setTrace "$1 instance: INSTANCE=$_xx"
+
+        getExePath "sapcontrol" $_xx;
+        if [ $? -eq 0 ]; then
+          instance_do $1 $_xx;
+        else
+          # no old instance_do_old implemented any longer
+          exitOnError 10 "sapcontrol not available for instance $_xx"
+        fi
+        _rc=$?;
+        if [ $_rc -ne 0 ]; then
+          exitOnError $_rc;
+        fi
+      done
+    ;;
+    *)
+      exitOnError 10 "Implementation error in Instance(): call support"
+    ;;
+    esac
+  fi
+  unset _xx;
+  unset _rc;
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## Instance() done"
+  return 0
+}
+
+
+#====================================================================
+#
+# FUNCTION: save_old_logs
+#
+# PURPOSE:
+save_old_logs()
+{
+  setTrace "## save_old_logs() start: @=$*"
+  sp="${sp} ";
+
+  for i in 8 7 6 5 4 3 2 1; do
+    j=`expr $i + 1`
+    _SRC=${1}.${i}
+    _TGT=${1}.${j}
+    if [ -f $_SRC ]; then
+      setTrace "cp ${_SRC} ${_TGT}"
+      cp ${_SRC} ${_TGT}
+    fi
+  done
+  # check log file 0 is available
+  if [ -f ${1} ]; then
+    setTrace "cp ${1} ${1}.1"
+    cp ${1} ${1}.1
+  fi
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## save_old_logs() done"
+}
+
+#====================================================================
+#
+# FUNCTION: instance_do
+#
+# PURPOSE: starts the SAP instance service and SAP instance
+#
+# PARAMETER
+# $1: start/stop
+# $2: INSTANCE
+#
+# GLOBAL PARAMETER
+# R3S_LOGDIR        logfile directory
+# PROFILE_DIR:      global profile dir
+# EXECMD:           variable set in getExePath
+# EXEDIR:           variable set in getExePath
+#
+# RETURN 0 = ok
+#        else error
+#
+instance_do()
+{
+
+( # start subshell
+  setTrace "## instance_do() start: @=$*"
+  sp="${sp} ";
+
+  # SET LOGFILE
+  LOGFILE="${R3S_LOGDIR}/${BASENAME}_${2}.log"
+  save_old_logs $LOGFILE;
+  init_log $0 $*;
+
+   # Set INSTANCE specific sapcontrol
+  getExePath "sapcontrol" $2;
+  if [ $? -eq 0 ]; then
+    _SAPCONTROL=$EXECMD
+    _SAPCONTROL_PATH=$EXEDIR
+
+    setTrace "_SAPCONTROL=$_SAPCONTROL"
+
+    # set additional environment per instance
+    set_path $_SAPCONTROL_PATH;
+
+    # get instance number
+    getSapsystemNr $2;
+    _returncode=$?
+
+    if [ $_returncode -eq 0 ]; then
+      _NR=$NR;
+      setTrace "_NR=$_NR";
+
+      case $1 in
+      # start instance_do
+      start*)
+        # start instance service sapstartsrv_do
+        sapstartsrv_do $1 $2
+        _returncode=$?
+        if [ $_returncode -eq 0 ]; then
+          writeLog "${1}ing SAP Instance ${2}";
+          writeLog "Startup-Log is written to $LOGFILE";
+          echo $LINE;
+
+          # starting with executable sapcontrol
+          writeLog "$_SAPCONTROL -prot NI_HTTP -nr $_NR -function Start";
+          eval  $_SAPCONTROL -prot NI_HTTP -nr $_NR -function Start >> $LOGFILE 2>&1
+          _returncode=$?
+
+          setTrace "wait sleep 10 while instance is starting"
+          sleep 10;
+
+          case $_returncode in
+          0)
+            writeLog "Instance on host $LOCAL_HOST ${1}ed";
+          ;;
+          *)
+            writeLog "${1}up of Instance failed";
+            printf " See $LOGFILE for details\n\n"
+          esac
+        fi
+      ;;
+      # stop instance_do
+      stop*)
+        writeLog "${1}ping the SAP instance $2";
+        writeLog "Shutdown-Log is written to $LOGFILE";
+        echo $LINE;
+
+        # initialize returncode
+        _returncode=0
+
+        # save pid and shmid
+        # check for TRX installation
+        get_killsap  $2;
+        if [ -f ${KILLSAP} ]; then
+          SAP_PID=`awk '{print $1}' ${DIR_HOME}/sapstart.sem`
+          SAP_SHM=`awk '{print $2}' ${DIR_HOME}/sapstart.sem`
+
+          # stopping with executable sapcontrol
+          writeLog "$_SAPCONTROL -prot NI_HTTP -nr $_NR -function Stop";
+          eval  $_SAPCONTROL -prot NI_HTTP -nr $_NR -function Stop >> $LOGFILE 2>&1
+          _returncode=$?
+
+          sleep 2;
+          case $_returncode in
+          0)
+            writeLog "Instance on host $LOCAL_HOST ${1}ped";
+            writeLog "Waiting for cleanup of resources";
+            case `uname` in
+            Linux*)
+              ps_command="ps ax"
+            ;;
+            *)
+              ps_command="ps -e"
+            ;;
+            esac
+            setTrace "ps_command=$ps_command"
+            while $ps_command | awk '{print $1}' | grep "^$SAP_PID$" >/dev/null || \
+              ipcs |awk '/^m / {print $2}' | grep "^$SAP_SHM$" >/dev/null; do
+              printf ".";
+              setTrace "sleep 2 in while"
+              sleep 2
+            done
+            printf "\n";
+          ;;
+
+          *)
+            writeLog "$1 of Instance failed";
+            printf " See $LOGFILE for details\n\n"
+          ;;
+          esac
+        else
+          writeLog "Instance ${2} was not running!";
+        fi
+      ;;
+      *)
+        # error occurred no valid $1 found
+        echo "Implementation error in instance_do(): call support"
+        setTrace "Implementation error in instance_do(): call support"
+        _returncode=10;
+      ;;
+      esac
+    fi
+  else
+    writeLog "sapcontrol not found";
+    writeLog "See $LOGFILE for details\n"
+    _returncode=11;
+  fi
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## instance_do() done"
+  exit $_returncode
+) # end subshell
+
+}
+
+#====================================================================
+#
+# FUNCTION: set_db_sid
+#
+# PURPOSE:  set env Variable DB_SID if on DB_HOST
+#
+set_db_sid()
+{
+  setTrace "## set_db_sid() start: @=$*";
+  sp="${sp} ";
+
+  DB_SID="$DB_SID"
+  if [ "X" = "X$DB_SID" ]; then
+    DB_SID="db"
+    if [ "$1" -eq 1 ];then
+      case "$dbms_type" in
+        ora|ORA)  DB_SID="$ORACLE_SID";;
+              *)  DB_SID="$dbms_type";;
+      esac
+    fi
+  fi
+  setTrace "DB_SID=$DB_SID"
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## set_db_sid() done"
+}
+
+
+#====================================================================
+#
+# FUNCTION: setPlatform
+#
+# PURPOSE:  set the value for PLATFORM for the exedir
+#
+#
+setPlatform()
+{
+  setTrace "## setPlatform() start"
+  sp="${sp} ";
+
+  case `uname` in
+    Linux)
+      case `uname -m` in
+        ia64)
+          PLATFORM=linuxia64
+          ;;
+        x86_64)
+          PLATFORM=linuxx86_64
+          ;;
+        s390x)
+          PLATFORM=linuxs390x
+          ;;
+        ppc64)
+          PLATFORM=linuxppc64
+          ;;
+        ppc64le)
+          PLATFORM=linuxppc64le
+          ;;
+        i686|i386)
+          PLATFORM=linuxintel
+          ;;
+        *)
+          PLATFORM=linux
+          ;;
+      esac
+      ;;
+
+    AIX*)
+      PLATFORM=rs6000_64
+      ;;
+
+    OS400*)
+      PLATFORM=as400_pase_64
+      ;;
+
+    Sun*)
+      case `uname -m` in
+        sun4u*)
+          PLATFORM=sun_64
+          ;;
+        i86pc)
+          PLATFORM=sunx86_64
+          ;;
+        *)
+          PLATFORM=sun
+          ;;
+      esac
+      ;;
+
+    HP*)
+      case `uname -m` in
+        ia64)
+          PLATFORM=hpia64
+          ;;
+        *)
+          PLATFORM=hp_64
+          ;;
+      esac
+      ;;
+
+    OSF*)
+      PLATFORM=alphaosf
+      ;;
+
+    OS/390*)
+      PLATFORM=os390
+      ;;
+
+    *)
+      PLATFORM="empty"
+      ;;
+
+  esac
+  setTrace "PLATFORM=$PLATFORM"
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## setPlatform() done"
+}
+
+#====================================================================
+#
+# FUNCTION: sapstartsrv_do
+#
+# PURPOSE: start and stop the sapstart service
+#
+# GLOBAL PARAMETER
+# LOGFILE INST* EXECMD EXEDIR NR
+#
+# PARAMETER
+# $1: start startsap / stop stopsap
+# $2 instance
+#
+
+sapstartsrv_do()
+{
+( # start subshell
+  setTrace "## sapstartsrv_do() start: @=$*"
+  sp="${sp} ";
+
+  if [ "X" = "X$1" -o "X" = "X$2" ]; then
+    writeLog "Implementation error in sapstartsrv_do(): call support"
+    _returncode=10;
+  else
+    # Set INSTANCE specific sapcontrol
+    getExePath "sapcontrol" $2;
+    if [ $? -ne 0 ]; then
+      writeLog "sapcontrol not found";
+      writeLog "See $LOGFILE for details\n";
+      _returncode=11;
+    else
+      _SAPCONTROL=$EXECMD
+      _SAPCONTROL_PATH=$EXEDIR
+      setTrace "_SAPCONTROL=$_SAPCONTROL"
+
+      # set additional environment per instance
+      set_path $EXEDIR;
+
+      # get global variable NR
+      getSapsystemNr $2;
+      _NR=$NR;
+
+      case $1 in
+      start*)
+        writeLog "Starting Startup Agent sapstartsrv";
+
+        # Set INSTANCE specific sapstartsrv
+        getExePath "sapstartsrv" $2;
+        if [ $? -ne 0 ]; then
+          writeLog "sapstartsrv not found";
+          writeLog "See $LOGFILE for details\n"
+          _returncode=11;
+        else
+          _SAPSTARTSRV=$EXECMD
+          setTrace "_SAPSTARTSRV=$_SAPSTARTSRV"
+
+
+          # Set START_PROFILE
+          _START_PROFILE=$PROFILE_DIR/START_${2}_${VHOST}
+          setTrace "_START_PROFILE=$_START_PROFILE";
+
+          # Set INSTANCE_PROFILE
+          _INSTANCE_PROFILE=$PROFILE_DIR/${SAPSYSTEMNAME}_${2}_${VHOST}
+          setTrace "_INSTANCE_PROFILE=$_INSTANCE_PROFILE";
+
+          if [ -f ${_START_PROFILE} ]; then
+            _PROFILE=${_START_PROFILE};
+          else
+            _PROFILE=${_INSTANCE_PROFILE};
+          fi
+
+          # set additional environment per instance
+          set_path $EXEDIR;
+
+          cd `dirname $_PROFILE`
+          setTrace "$_SAPSTARTSRV pf=$_PROFILE -D"
+          $_SAPSTARTSRV pf=$_PROFILE -D >> $LOGFILE 2>&1
+
+          setTrace "ask sapcontrol when service is started"
+          setTrace "$_SAPCONTROL -nr $_NR -function WaitforServiceStarted 120 10"
+
+          eval $_SAPCONTROL -nr $_NR -function WaitforServiceStarted 120 10
+          _returncode=$?
+
+          case $_returncode in
+          0)
+            writeLog "Instance Service on host $LOCAL_HOST started";
+          ;;
+          *)
+            writeLog "Startup of Instance Service failed";
+            writeLog "See $LOGFILE for details\n"
+          ;;
+          esac
+        fi
+      ;;
+
+      stop*)
+        writeLog "\nStopping Startup Agent sapstartsrv"
+
+        _returncode=0
+        if [ "X" != "X$_SAPCONTROL" ];then
+
+          setTrace "$_SAPCONTROL -prot NI_HTTP -nr $_NR -function StopService"
+
+          eval $_SAPCONTROL -prot NI_HTTP -nr $_NR -function StopService
+          _returncode=$?
+
+          setTrace "wait sleep 10 while service is stopping"
+          sleep 10;
+
+          case $_returncode in
+          0)
+            writeLog "Startup Agent sapstartsrv stopped for $SAPSYSTEMNAME $2 $VHOST";
+          ;;
+          *)
+            writeLog "Stopping sapstartsrv failed for $SAPSYSTEMNAME $2 $VHOST";
+          ;;
+          esac
+        fi
+      ;;
+
+      *)
+        writeLog "Implementation error 2 in sapstartsrv_do(): call support"
+        _returncode=10
+      ;;
+      esac
+    fi
+  fi
+
+  echo $LINE;
+  setTrace "_returncode=$_returncode"
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## sapstartsrv_do() done: $_returncode"
+  exit $_returncode
+) # end subshell
+}
+
+
+#====================================================================
+#
+# FUNCTION: getSapsystemNr
+#
+# PURPOSE: get sapsystemnr for specified instance
+#
+getSapsystemNr()
+{
+  setTrace "## getSapsystemNr() start: @=$*"
+  sp="${sp} ";
+
+  if [ "X" = "X$1" ]; then
+    exitOnError 10 "Implementation error in getSapsystemNr(): call support"
+  fi
+
+  # set INSTANCE specific sappfpar
+  getExePath "sappfpar" $1;
+  if [ $? -ne 0 ]; then
+    exitOnError 11 " sappfpar not found"
+  else
+    _SAPPFPAR=$EXECMD
+  fi
+  setTrace "_SAPPFPAR=$_SAPPFPAR"
+
+  set_path $EXEDIR;
+
+  # Set _INST_PROFILE
+  _INST_PROFILE=${SAPSYSTEMNAME}_${1}_${VHOST}
+  setTrace "_INST_PROFILE=$_INST_PROFILE";
+
+  # get instance number
+  NR=`$_SAPPFPAR pf=$PROFILE_DIR/$_INST_PROFILE SAPSYSTEM 2>/dev/null`;
+
+  restore_path;
+
+  if [ "X" = "X$NR" ]; then
+    NR=`echo $1 | awk '{print substr($0,length($0)-1,2)}'`
+  fi
+  setTrace "NR=$NR";
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## getSapsystemNr() done"
+  return 0;
+}
+
+#====================================================================
+#
+# FUNCTION: runSapstartsrv
+#
+# PURPOSE:
+#
+runSapstartsrv()
+{
+  setTrace "## runSapstartsrv() start";
+  sp="${sp} ";
+
+  LOGFILE="${R3S_LOGDIR}/${BASENAME}_sapstartsrv.log"
+  setTrace "LOGFILE=$LOGFILE";
+
+  for _ii in $INSTdvebmgs $INSTd $INSTscs $INSTascs $INSTers $INSTsmda $INSTj $INSTjc $INSTjms $INSTv $INSTw; do
+
+    sapstartsrv_do ${BASENAME} $_ii;
+    _rc=$?;
+    [ $_rc -ne 0 ] && return $_rc;
+
+  done;
+
+  # start the instance where more than one exists of the same instance type
+  for _xx in `echo "$NINST"`; do
+    sapstartsrv_do ${BASENAME} $_xx;
+    _rc=$?;
+    [ $_rc -ne 0 ] && exit $_rc;
+  done
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## runSapstartsrv() done";
+  return $_rc;
+}
+
+
+#====================================================================
+#
+# FUNCTION: runSaphostagent
+#
+# PURPOSE: only start the sap host agent
+#
+# GLOBAL PARAMETER
+# LOGFILE BASENAME
+#
+# PARAMETER
+#   No parameter supported.
+#
+runSaphostagent()
+{
+  setTrace "## runSaphostagent() start";
+  sp="${sp} ";
+
+  LOGFILE="${R3S_LOGDIR}/${BASENAME}_saphostagent.log"
+  setTrace "LOGFILE=$LOGFILE";
+
+  _SAPHOSTAGENTPATH="/usr/sap/hostctrl/exe/hostexecstart"
+  if [ -x "$_SAPHOSTAGENTPATH" ]; then
+    $_SAPHOSTAGENTPATH >> $LOGFILE 2>&1
+  else
+    setTrace "_SAPHOSTAGENTPATH=$_SAPHOSTAGENTPATH not found";
+    # If no saphostagent starter is found just ignore it.
+  fi
+
+  sp=`echo "$sp"|sed s/" "//`;
+  setTrace "## runSaphostagent() done";
+  return $_rc;
+}
+
+#====================================================================
+##################################
+###############################
+############################
+#########################
+######################         M A I N     Procedure
+###################
+################
+#############
+##########
+# Set HOSTNAME
+# Do not remove the former line for compatibility!!!!
+
+# initialisation
+TRACEHEADER=""
+LINE="-------------------------------------------";
+
+# set BASENAME
+_BASENAME=`basename $0`
+
+case "$_BASENAME" in
+start*)
+  BASENAME=startsap
+;;
+stop*)
+  BASENAME=stopsap
+;;
+*)
+  BASENAME="$_BASENAME"
+  exitOnError 10 "Implementation error 1 in main(): call support"
+esac
+
+setTrace "## Main() start: @=$0 $*";
+sp="${sp} ";
+
+# Set LOGDIR and LOGFILE
+if [ -z "$R3S_LOGDIR" ]; then
+   R3S_LOGDIR="$HOME"
+fi
+
+# write startsap version in trace file
+setTrace '@(#) $Id: //bas/745_STACK/src/krn/startscripts/startsap#2 $'
+
+setTrace "BASENAME=$BASENAME";
+
+# initialize for save_path() and restore_path()
+RESTORE_PATH=0;
+
+# Check SAPSYSTEMNAME
+if  [ -z "$SAPSYSTEMNAME" ];then
+  exitOnError 4 "SAPSYSTEMNAME not set"
+fi
+
+# makro set to lower case
+#TRUL='tr "[:upper:]" "[:lower:]"' or TRUL='tr "[A-Z]" "[a-z]"' doesn't work on all platforms when specific locales are set
+TRUL='tr "ABCDEFGHIJKLMNOPQRSTUVWXYZ" "abcdefghijklmnopqrstuvwxyz"'
+
+# Checks if user is <SID>adm
+_ADMUSER="`echo $SAPSYSTEMNAME | $TRUL`adm"
+check_user $_ADMUSER;
+unset _ADMUSER;
+
+# write number of arguments
+setTrace "#=$#"
+
+# write arguments
+setTrace "@=$*"
+
+#set global variable $PLATFORM
+setPlatform;
+
+
+# set LOCAL_HOST
+LOCAL_HOST=`uname -n`
+
+# set parameter vhostcheck
+vhostcheck="false"
+
+# set parameter vcheck
+vcheck="false"
+
+# init global variables for arg
+INST=""
+TASK=""
+VHOST=""
+
+# init global variables for setInstanceDo
+INSTFOUND=0
+NINSTFOUND=0;
+
+# global variables for different types of instances
+INSTscs=""
+INSTascs=""
+INSTjc=""
+INSTj=""
+INSTdvebmgs=""
+INSTd=""
+INSTg=""
+INSTtrx=""
+INSTw=""
+INSTv=""
+INSTjms=""
+INSTers=""
+INSTsmda=""
+
+PROFILEscs=""
+PROFILEascs=""
+PROFILEjc=""
+PROFILEj=""
+PROFILEdvebmgs=""
+PROFILEd=""
+PROFILEg=""
+PROFILEtrx=""
+PROFILEw=""
+PROFILEv=""
+PROFILEjms=""
+PROFILEers=""
+PROFILEsmda=""
+
+# additional instances for same instance type
+NINST=""
+
+# virtual host array list
+VHOSTS=""
+
+# search for ping and set global variable $PING
+setPing;
+
+# search for ifconfig and set global variable $IFCONFIG
+setIfconfig;
+
+# search for ip and set global variable $IP
+setIp;
+
+# check only with R3trans if instance type = D*
+hasABAP=0
+
+# check only with JDBCCONNECT if instance type = J*
+hasJava=0
+
+# scs, gateway, .. instance is available but this instances need no database but database need to start if local
+hasSpecial=0
+
+# set default values for USR_SAP_SID and PROFILE_DIR
+setRootDir;
+
+# set default values for SAPUSER UPGRADE_CONNECT dbs_sapr3
+setDbUser;
+
+#
+# Evaluate command line options
+#
+# no parameter: set to default
+checkopt="false";
+if [ $# -eq 0 ]; then
+
+  checkopt="true";
+
+  # set global parameter VHOST and HOSTNAME
+  #setHostname;
+
+  # set global parameter array list VHOSTS
+  setVHostArray;
+
+  # search for instances in profile directory
+  set_instance;
+
+  # set default TASK
+  TASK=ALL;
+
+fi;
+
+# Parse command line
+# new parameter input stype with -*
+
+# check for shadow system parameter for upgrade task
+_upgrade=0;
+
+while [ $# -gt 0 ]; do
+  setTrace "Argument=$1"
+  case $1 in
+  -VERSION|-V )
+    version;
+    exitOnError 0
+  ;;
+
+  -help|-h )
+    usage;
+    exitOnError 2
+  ;;
+
+  -check|-c )
+    vcheck="true";
+    shift;
+    ;;
+
+  -checkVHost|-C )
+    vhostcheck="true"
+    shift;
+    ;;
+
+  -rootdir|-r )
+    shift;
+    if [ "X$1" = "X" ]; then
+      writeLog "Invalid option: need a rootdir";
+      usage;
+      exitOnError 2;
+    else
+      setRootDir $1;
+      shift;
+      checkopt="true";
+      _upgrade=`expr $_upgrade + 1`
+      auth_shadow_upgrade=1;
+    fi
+    ;;
+
+  -user|-u )
+    shift;
+    if [ "X$1" = "X" ]; then
+      writeLog "Invalid option: need a user";
+      usage;
+      exitOnError 2;
+    else
+      setDbUser $1;
+      shift;
+      checkopt="true";
+      _upgrade=`expr $_upgrade + 1`
+      auth_shadow_upgrade=1;
+    fi
+    ;;
+
+  -vhost|-v )
+    shift;
+    if [ "X$1" = "X" ]; then
+      writeLog "Invalid option: need a hostname";
+      usage;
+      exitOnError 2;
+    else
+      pushVHostsFromArg $1;
+      shift;
+      checkopt="true";
+    fi
+    ;;
+
+  -task|-t )
+    shift;
+    if [ "X$1" = "X" ]; then
+      writeLog "Invalid option: needs a valid TASK";
+      usage;
+      exitOnError 2;
+    else
+      setTrace "Argument=$1"
+      checkTask $1;
+      if [ $? -ne 0 ]; then
+        writeLog "Invalid TASK: $1";
+        usage;
+        exitOnError 2;
+      fi
+      shift;
+      checkopt="true";
+    fi
+    ;;
+
+  -instance|-i )
+    shift;
+    if [ "X$1" = "X" ]; then
+      writeLog "Invalid option: need a valid instance name";
+      usage;
+      exitOnError 2;
+    else
+      checkInstance $1
+      if [ $? -ne 0 ]; then
+        writeLog "Invalid Instance: $1";
+        usage;
+        exitOnError 2;
+      fi;
+      INST=$1;
+      shift;
+      checkopt="true";
+    fi
+    ;;
+
+  -*)
+    writeLog "Invalid Option $1"
+    usage;
+    exitOnError 2
+  ;;
+  *)
+    if [ "X$checkopt" = "Xtrue" ]; then
+      writeLog "Invalid Option $1";
+      usage;
+      exitOnError 2
+    else
+      break;
+    fi
+  ;;
+  esac
+done
+
+# check for upgrade task
+if [ $auth_shadow_upgrade -eq 1 -a $_upgrade -ne 2 ]; then
+  writeLog "Invalid Option: -rootdir and -user must be specified for upgrade task";
+  usage;
+  exitOnError 2;
+fi
+
+# check for vHostCheck
+if [ "X$vhostcheck" = "Xtrue" ]; then
+  runVHostCheck;
+fi
+
+# no new option types found
+# get the old parameter list style
+if [ "X$checkopt" = "Xfalse" ]; then
+  getarg "$*"
+  _OPTIONS=$?;
+  # not all arguments are valid
+  if [ "$_OPTIONS" -lt $# ]; then
+    writeLog "Wrong argument(s) $*"
+    usage;
+    exitOnError 2
+  fi
+  unset _OPTIONS;
+fi
+
+# check of valid import parameter!!
+
+# check for VHOSTS array list
+if [ "X$VHOSTS" = "X" ]; then
+  setVHostArray;
+fi
+
+# check vcheck
+if [ "X$vcheck" = "Xtrue" ]; then
+  runCheck;
+  exitOnError $?
+fi
+
+# check INST
+if [ "X$INST" = "X" ]; then
+  set_instance
+else
+  for VHOST in $VHOSTS; do            # could be also a array list now
+    _PROFILE=${USR_SAP_SID}/SYS/profile/${SAPSYSTEMNAME}_${INST}_${VHOST}
+    if [ ! -f ${_PROFILE} ]; then
+      setTrace "$VHOST: instance profile ${_PROFILE} not found"
+    else
+      break
+    fi
+  done
+  if [ ! -f ${_PROFILE} ]; then
+    exitOnError 8 "No instance profiles found"
+  fi
+  if [ "$INSTFOUND" -eq 0 ]; then
+    # set_instance was not running
+    setInstanceDo "$INST" "$_PROFILE";
+    unset _PROFILE;
+  fi
+fi
+
+# set default TASK when not set
+if [ "X" = "X$TASK" ]; then
+  TASK=ALL
+fi
+
+# check for any existing instance profile
+if [ "$TASK" = "ALL" -o "$TASK" = "R3" -o "$TASK" = "CCMS" ]; then
+  if [ "$INSTFOUND" -eq 0 ]; then
+    exitOnError 8 "No instance profiles found"
+  fi
+fi
+
+# end of scanning the import parameters
+
+# start/stop the CCMS agent only
+if [ "X$TASK" = "XCCMS" ]; then
+  sapccm4x $BASENAME;
+  exitOnError $?;
+fi
+
+# start/stop the sapstartsrv service only
+if [ "X$TASK" = "XSTARTUPSRV" ]; then
+  runSapstartsrv;
+  exitOnError $?;
+fi
+
+# prepare *DB_LOCAL *DB_RUNNING *DB_SID
+prepare;
+
+# other TASK options than check, ccms, startupsrv
+#
+# "$TASK" = "R3"  start/stop instance, database must running
+# "$TASK" = "ALL" start/stop database and r3
+# "$TASK" = "DB"  start/stop abap/java database only
+#
+
+setTrace "DB_LOCAL=$DB_LOCAL"
+setTrace "DB_RUNNING=$DB_RUNNING"
+setTrace "hasABAP=$hasABAP"
+setTrace "hasJava=$hasJava"
+setTrace "hasSpecial=$hasSpecial"
+
+case "$BASENAME" in
+
+start*)
+  setTrace "TASK=$TASK"
+
+  ### starting abap db (hasABAP == 1)
+  if [ "$hasABAP" -eq 1 -a "$DB_RUNNING" -eq 0 ]; then
+    if [ "$TASK" = "R3" ]; then
+      # database not running but want to start the instances
+      writeLog "Database $DB_SID must be started first"
+      exitOnError 6;
+    elif [ "$DB_LOCAL" -eq 0 ]; then
+      # database not running and remote
+      writeLog "Database $DB_SID must be started first"
+      writeLog "Log on to remote server and start database"
+      exitOnError 6;
+    else
+      # start database
+      Database "start";
+    fi
+  fi # end database
+
+  ### starting J2EE database (hasJava == 1)
+  setTrace "JDB_LOCAL=$JDB_LOCAL"
+
+  if [ "$hasJava" -eq 1 -a "$JDB_RUNNING" -eq 0 ]; then
+    if [ "$TASK" = "R3" ]; then
+      # database not running but want to start the instances
+      writeLog "Database $DB_SID must be started first"
+      exitOnError 6;
+    elif [ "$JDB_LOCAL" -eq 0 ]; then
+      # database not running and remote
+      writeLog "Database $DB_SID must be started on remote server"
+      writeLog "Log on to remote server and start database"
+      exitOnError 6;
+    fi
+  fi
+
+  if [ "$TASK" != "R3" -a "$JDB_LOCAL" -eq 1 ]; then
+    setTrace "JDB_RUNNING=$JDB_RUNNING"
+
+    if [ "$hasJava" -eq 1 -a "$JDB_RUNNING" -ne 1 -a -n "$SAPJDBHOST" ]; then
+      J2ee_database "start";
+    fi
+  fi # end starting J2EE database
+
+  ### starting database (hasSpecial = 1 and hasABAP == 0 and hasJava == 0)
+  if [ "$hasSpecial" -eq 1 -a "$hasABAP" -eq 0 -a "$hasJava" -eq 0 ]; then
+    if [ "$TASK" != "R3" ]; then
+      if [ "$JDB_LOCAL" -eq 1 ]; then
+        J2ee_database "start";
+      elif [ "$DB_LOCAL" -eq 1 ]; then
+        Database "start";
+      fi
+    fi
+  fi
+
+  ### starting instance(s)
+  if [ "$TASK" = "ALL" -o "$TASK" = "R3" ];then
+    Instance "start";
+    _rc=$?;
+    [ $_rc -ne 0 ] && exit $_rc;
+  fi
+
+  # Starting CCMS agent SAPCCM4X. Does nothing if agent is not configured
+  sapccm4x "start";
+
+  # start the SAP Host Agent (no stop supported)
+  # In case of OS/390 don't start SAP Host Agent - TK, 21.7.2011
+  if  [ `uname` != OS\/390 -a `uname` != z\/OS ]; then
+    runSaphostagent;
+  fi
+;;
+stop*)
+
+  # Stoping CCMS agent only by task ccms
+  # sapccm4x "stop";
+
+  if [ "$TASK" = "ALL" -o "$TASK" = "R3" ];then
+    Instance "stop";
+    _rc=$?;
+    [ $_rc -ne 0 ] && exit $_rc;
+  fi
+
+  #set TASK=R3 if database is remote so we cannot stop it
+  if [ "$TASK" = "ALL" ]; then
+    if [ "$DB_LOCAL" -eq 0 -a "$JDB_LOCAL" -eq 0 ]; then
+      TASK=R3;
+      setTrace "TASK=$TASK"
+    fi
+  fi
+
+  # Stop database
+  # in case of os390 no database have to stop
+  case `uname` in
+  OS/390*)
+    exitOnError 0
+  ;;
+  esac
+
+  setTrace "TASK=$TASK"
+  if [ "$TASK" = "ALL" -o "$TASK" = "DB" ]; then
+
+    ### stop abap db (hasABAP == 1)
+    if [ "$hasABAP" -eq 1 -a "$DB_RUNNING" -eq 1 ]; then
+      if [ $DB_LOCAL -eq 0 ]; then
+        writeLog "Database is still running on remote DB server"
+        writeLog "Log on to DB server and stop database"
+        exitOnError 6;
+      else
+        Database "stop";
+      fi
+    fi
+
+    ### stop J2EE Database
+    if [ "$hasJava" -eq 1 -a "$JDB_RUNNING" -ne 0 ]; then
+      if [ "$JDB_LOCAL" -eq 1 ]; then
+        J2ee_database "stop";
+      fi
+    fi
+    if [ "$hasSpecial" -eq 1 -a "$hasABAP" -eq 0 -a "$hasJava" -eq 0 ]; then
+      if [ "$JDB_LOCAL" -eq 1 ]; then
+        J2ee_database "stop";
+      elif [ "$DB_LOCAL" -eq 1 ]; then
+        DB_RUNNING=1;
+        Database "stop";
+      fi
+    fi
+  fi
+;;
+*)
+  exitOnError 10 "Implementation error 2 in main(): call support"
+;;
+esac
+
+sp=`echo "$sp"|sed s/" "//`;
+setTrace "## Main() done";
+exitOnError 0
